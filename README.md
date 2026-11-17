@@ -198,6 +198,10 @@ set PYTHONPATH=.
 .venv\Scripts\python.exe -m mh.cli index search --model siglip2 --text "蓝发 动漫少女 海边" --top 20
 .venv\Scripts\python.exe -m mh.cli index serve --port 8765 --model siglip2 --device cuda
 
+:: safe 目录 Huihui 复核：先 dry-run，再确认 --apply
+.venv\Scripts\python.exe -m mh.safe_reclass --limit 9
+.venv\Scripts\python.exe -m mh.safe_reclass --workers 4 --slots 4 --apply
+
 :: 旧 NSFW SigLIP 索引仍可用（不删）
 .venv\Scripts\python.exe -m mh.cli index status --model nsfw
 
