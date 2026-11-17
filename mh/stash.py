@@ -67,6 +67,14 @@ class Stash:
             raise RuntimeError(f"stash graphql error: {data['errors'][:2]}")
         return data["data"]
 
+    def image_path(self, image_id: str) -> str | None:
+        data = self.graphql(
+            "query($id:ID!){ findImage(id:$id){ visual_files{ ... on ImageFile { path } ... on VideoFile { path } } } }",
+            {"id": str(image_id)},
+        )
+        files = (data.get("findImage") or {}).get("visual_files") or []
+        return files[0].get("path") if files else None
+
     def wait_ready(self, timeout: float = 180) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -84,7 +92,7 @@ class Stash:
         (plugin_dir / "minehub.yml").write_text(
             """name: MineHub Native Search
 description: MineHub text search, QQ cache and similarity entry points served through the same-origin gateway.
-version: 1.0.0
+version: 1.0.2
 ui:
   javascript:
     - custom_minehub.js

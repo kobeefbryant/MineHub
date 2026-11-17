@@ -4,7 +4,14 @@
   var BASE = "/mh/api";
   var busy = false;
   var LAST_SEARCH = null;
+  var QUEUED_SEARCH = null;
   var scoreTimer = null;
+  var SCORE_KIND = "text";
+  var SCORE_PRESETS = { text: [0.03, 0.055, 0.08, 0.12, 0.18], image: [0.65, 0.75, 0.82, 0.90, 0.95] };
+  var TOP_PRESETS = [24, 48, 100];
+  var PAGE_PATH = "/mh";
+  var PAGE_QUERY = null;
+  var GIF_INFO = null;
   var PM = {
     cfg: null,
     chats: [],
@@ -165,23 +172,7 @@
     if (box) box.classList.remove("open");
   }
 
-  function openSearch(ctx) {
-    ensureModal();
-    var box = document.getElementById("mh-backdrop");
-    var title = document.getElementById("mh-title");
-    document.getElementById("mh-results").textContent = "";
-    setStatus("");
-    if (ctx && ctx.id) {
-      title.textContent = "相似于 " + (ctx.kind === "scene" ? "场景" : "图片") + " #" + ctx.id;
-      doSearch({ stash_id: String(ctx.id), kind: ctx.kind, top: 24 });
-    } else {
-      title.textContent = "MineHub 搜索";
-    }
-    box.classList.add("open");
-    var input = document.getElementById("mh-q");
-    if (input) setTimeout(function () { input.focus(); }, 50);
-  }
-
+  
   function scoreValue() {
     var el = document.getElementById("mh-min-score");
     var n = el ? parseFloat(el.value) : 0;
@@ -193,9 +184,39 @@
     if (el) el.textContent = scoreValue().toFixed(3);
   }
 
+  function renderScorePresets() {
+    var box = document.getElementById("mh-score-presets");
+    if (!box) return;
+    var values = SCORE_PRESETS[SCORE_KIND] || SCORE_PRESETS.text;
+    var current = scoreValue();
+    box.textContent = "";
+    values.forEach(function (v) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "mh-preset" + (Math.abs(v - current) < 0.0001 ? " active" : "");
+      b.textContent = v.toFixed(3);
+      b.onclick = function () { setScoreValue(v); };
+      box.appendChild(b);
+    });
+  }
+
+  function setScoreValue(value) {
+    var el = document.getElementById("mh-min-score");
+    if (!el) return;
+    var min = parseFloat(el.min);
+    var max = parseFloat(el.max);
+    var v = Math.max(min, Math.min(max, Number(value)));
+    if (!Number.isFinite(v)) return;
+    el.value = String(v);
+    updateScoreLabel();
+    renderScorePresets();
+    rerunWithOptions();
+  }
+
   function setScoreRange(kind) {
     var el = document.getElementById("mh-min-score");
     if (!el) return;
+    SCORE_KIND = kind === "image" ? "image" : "text";
     var value = parseFloat(el.value);
     if (kind === "text") {
       el.min = "0";
@@ -209,10 +230,43 @@
       if (!Number.isFinite(value) || value < 0.5) el.value = "0.82";
     }
     updateScoreLabel();
+    renderScorePresets();
   }
 
-  function rerunWithThreshold() {
+  function topValue() {
+    var el = document.getElementById("mh-top");
+    var n = el ? parseInt(el.value, 10) : 24;
+    return Number.isFinite(n) ? Math.max(1, Math.min(100, n)) : 24;
+  }
+
+  function renderTopPresets() {
+    var box = document.getElementById("mh-top-presets");
+    if (!box) return;
+    var current = topValue();
+    box.textContent = "";
+    TOP_PRESETS.forEach(function (n) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "mh-preset" + (n === current ? " active" : "");
+      b.textContent = String(n);
+      b.onclick = function () { setTopValue(n); };
+      box.appendChild(b);
+    });
+  }
+
+  function setTopValue(value) {
+    var el = document.getElementById("mh-top");
+    if (!el) return;
+    var n = parseInt(value, 10);
+    if (!Number.isFinite(n)) n = 24;
+    el.value = String(Math.max(1, Math.min(100, n)));
+    renderTopPresets();
+    rerunWithOptions();
+  }
+
+  function rerunWithOptions() {
     if (!LAST_SEARCH) return;
+    LAST_SEARCH = Object.assign({}, LAST_SEARCH, { min_score: scoreValue(), top: topValue() });
     clearTimeout(scoreTimer);
     scoreTimer = setTimeout(function () { if (LAST_SEARCH) doSearch(LAST_SEARCH); }, 250);
   }
@@ -225,12 +279,12 @@
     if (hint) hint.style.display = "none";
     setScoreRange("text");
     document.getElementById("mh-title").textContent = "MineHub 搜索";
-    doSearch({ text: text, top: 24, min_score: scoreValue() });
+    doSearch({ text: text, top: topValue(), min_score: scoreValue() });
   }
 
   function doSearch(payload) {
-    if (busy) return;
     LAST_SEARCH = payload;
+    if (busy) { QUEUED_SEARCH = payload; return; }
     busy = true;
     setStatus("搜索中…");
     var results = document.getElementById("mh-results");
@@ -249,7 +303,9 @@
       });
     }).then(function (j) {
       var rows = j.results || [];
-      setStatus(rows.length ? ("共 " + rows.length + " 个结果") : "没有找到结果");
+      var cutoff = Number(payload.min_score);
+      var cutoffText = Number.isFinite(cutoff) ? " · 相似度 ≥ " + cutoff.toFixed(3) : "";
+      setStatus(rows.length ? ("共 " + rows.length + " 个结果" + cutoffText) : ("没有找到结果" + cutoffText));
       rows.forEach(function (x) {
         var a = document.createElement("a");
         a.className = "mh-card";
@@ -273,6 +329,11 @@
     }).finally(function () {
       clearTimeout(timer);
       busy = false;
+      if (QUEUED_SEARCH) {
+        var next = QUEUED_SEARCH;
+        QUEUED_SEARCH = null;
+        doSearch(next);
+      }
     });
   }
 
@@ -1036,7 +1097,7 @@
     var style = document.createElement("style");
     style.id = "mh-hub-style";
     style.textContent = [
-      "#mh-hub{display:none;position:fixed;inset:0;z-index:1020;overflow:auto;background:#202b33;color:#f5f8fa;padding:70px 0 24px}",
+      "#mh-hub{display:none;background:transparent;color:#f5f8fa;padding:8px 0 32px;min-height:calc(100vh - 80px)}",
       "#mh-hub.open{display:block}",
       "#mh-hub .mh-hub-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}",
       "#mh-hub .mh-hub-head h2{margin:0;color:#f5f8fa}",
@@ -1095,6 +1156,11 @@
       "#mh-hub .mh-dupe-exact-row .path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
       "#mh-hub #mh-dupe-similar-opts label,#mh-hub #mh-dupe-similar-opts span{white-space:nowrap}",
       "#mh-hub .mh-placeholder h4{color:#f5f8fa}",
+      "#mh-hub .mh-preset{margin-left:5px;padding:2px 8px;border:1px solid #4a5b69;border-radius:4px;background:#26333f;color:#c4d0da;font-size:12px;cursor:pointer}",
+      "#mh-hub .mh-preset:hover{border-color:#48aff0;color:#fff}",
+      "#mh-hub .mh-preset.active{background:#48aff0;border-color:#48aff0;color:#15212b}",
+      "#mh-gif-note{margin:4px 0 14px;padding:9px 12px;border-left:4px solid #48aff0;border-radius:4px;background:#24323c;color:#c4d0da;font-size:13px;line-height:1.6}",
+      "#mh-gif-note strong{color:#f5f8fa}",
       "#mh-pm-preview{display:none;position:fixed;inset:0;z-index:2147483647;background:rgba(10,15,20,.92);align-items:center;justify-content:center}",
       "#mh-pm-preview.open{display:flex}",
       "#mh-pm-preview-box{max-width:94vw;max-height:94vh;display:flex;flex-direction:column;gap:8px;align-items:center}",
@@ -1115,7 +1181,6 @@
         <div class="mh-hub-head">
           <h2>MineHub</h2>
           <span id="mh-hub-status" class="mh-hub-status"></span>
-          <button id="mh-hub-close" class="btn btn-secondary btn-sm">关闭</button>
         </div>
         <ul id="mh-hub-tabs" class="nav nav-tabs mb-3">
           <li class="nav-item"><a href="#" class="nav-link active" data-mh-tab="search">搜索</a></li>
@@ -1129,15 +1194,23 @@
             <input id="mh-q" class="form-control" placeholder="中文/英文描述搜图，或输入图片/场景 ID">
             <div class="input-group-append"><button id="mh-go" class="btn btn-primary">搜索</button></div>
           </div>
-          <div class="d-flex align-items-center mb-2" style="max-width:760px">
+          <div class="d-flex flex-wrap align-items-center mb-2" style="max-width:900px">
             <label for="mh-min-score" class="small text-muted mb-0 mr-2">相似度 ≥ <span id="mh-min-score-val">0.055</span></label>
-            <input id="mh-min-score" type="range" min="0" max="0.5" step="0.005" value="0.055" class="custom-range flex-grow-1">
+            <input id="mh-min-score" type="range" min="0" max="0.5" step="0.005" value="0.055" class="custom-range flex-grow-1" style="min-width:220px">
+            <span id="mh-score-presets" class="ml-2"></span>
+          </div>
+          <div class="d-flex flex-wrap align-items-center mb-2" style="max-width:900px">
+            <label for="mh-top" class="small text-muted mb-0 mr-2">结果数</label>
+            <input id="mh-top" type="number" min="1" max="100" step="1" value="24" class="form-control form-control-sm" style="width:76px">
+            <span id="mh-top-presets" class="ml-2"></span>
+            <span class="small text-muted ml-2">最多 100</span>
           </div>
           <div class="mb-2"><span id="mh-title" class="text-muted"></span></div>
           <div id="mh-status" class="text-muted mb-3"></div>
           <div id="mh-search-hint" class="mh-empty-state">
             <strong>搜索 MineHub 图库</strong>
             输入中文或英文描述查找已入库的图片与场景；也可以打开任意图片或场景，在工具栏点击「找相似」。
+            <p class="small text-muted mb-0 mt-2">搜索使用 SigLIP2 语义向量，不要求图片标签包含关键词；结果不一定带有「电脑」等查询词标签。</p>
           </div>
           <div id="mh-results" class="mh-card-grid"></div>
         </div>
@@ -1234,10 +1307,10 @@
           </div>
         </div>
       </div>`;
-    document.body.appendChild(el);
+    var mount = document.querySelector(".main.container-fluid") || document.body;
+    mount.appendChild(el);
     hubEl = el;
 
-    document.getElementById("mh-hub-close").onclick = closeHub;
     document.getElementById("mh-hub-tabs").addEventListener("click", function (e) {
       var link = e.target.closest("[data-mh-tab]");
       if (!link) return;
@@ -1275,8 +1348,18 @@
     document.getElementById("mh-q").onkeydown = function (e) { if (e.key === "Enter") searchText(); };
     document.getElementById("mh-min-score").addEventListener("input", function () {
       updateScoreLabel();
-      rerunWithThreshold();
+      renderScorePresets();
+      rerunWithOptions();
     });
+    document.getElementById("mh-top").addEventListener("input", function () {
+      renderTopPresets();
+      rerunWithOptions();
+    });
+    document.getElementById("mh-top").addEventListener("change", function () {
+      setTopValue(topValue());
+    });
+    renderScorePresets();
+    renderTopPresets();
     document.getElementById("mh-dupe-mode").addEventListener("change", dupeToggleMode);
     document.getElementById("mh-dupe-scan").onclick = dupeScan;
     document.getElementById("mh-dupe-query").onclick = dupeQuery;
@@ -1322,36 +1405,81 @@
     }
   }
 
-  function openHub(tab) {
-    ensureHub();
-    hubEl.classList.add("open");
-    activateTab(tab || "search");
+  function pageQuery() {
+    var p = new URLSearchParams(location.search);
+    return {
+      id: p.get("stash_id") || "",
+      kind: p.get("kind") || "image",
+      text: p.get("q") || p.get("text") || "",
+      tab: p.get("tab") || "search"
+    };
   }
 
-  function closeHub() {
-    if (hubEl) hubEl.classList.remove("open");
-    var a = document.querySelector("#mh-nav-item a");
-    if (a) a.classList.remove("active");
-  }
-
-  function openSearch(ctx) {
-    openHub("search");
+  function runPageQuery() {
+    var p = pageQuery();
+    if (p.tab !== "search") {
+      activateTab(p.tab);
+      return;
+    }
+    activateTab("search");
     var title = document.getElementById("mh-title");
-    var results = document.getElementById("mh-results");
-    if (results) results.textContent = "";
     var hint = document.getElementById("mh-search-hint");
-    if (hint) hint.style.display = ctx && ctx.id ? "none" : "";
-    setStatus("");
-    if (ctx && ctx.id) {
+    var input = document.getElementById("mh-q");
+    if (p.id) {
       setScoreRange("image");
-      if (title) title.textContent = "相似于 " + (ctx.kind === "scene" ? "场景" : "图片") + " #" + ctx.id;
-      doSearch({ stash_id: String(ctx.id), kind: ctx.kind, top: 24, min_score: scoreValue() });
+      if (title) title.textContent = "相似于 " + (p.kind === "scene" ? "场景" : "图片") + " #" + p.id;
+      if (hint) hint.style.display = "none";
+      doSearch({ stash_id: String(p.id), kind: p.kind, top: topValue(), min_score: scoreValue() });
+    } else if (p.text) {
+      if (input) input.value = p.text;
+      setScoreRange("text");
+      if (title) title.textContent = "MineHub 搜索";
+      if (hint) hint.style.display = "none";
+      doSearch({ text: p.text, top: topValue(), min_score: scoreValue() });
     } else {
       setScoreRange("text");
       if (title) title.textContent = "";
-      var input = document.getElementById("mh-q");
-      if (input) setTimeout(function () { input.focus(); }, 60);
+      var results = document.getElementById("mh-results");
+      if (hint && (!results || !results.children.length)) hint.style.display = "";
     }
+  }
+
+  function syncPage() {
+    var onPage = location.pathname === PAGE_PATH;
+    var navItem = document.getElementById("mh-nav-item");
+    if (navItem) navItem.classList.toggle("active", onPage);
+    if (!onPage) {
+      if (hubEl) hubEl.classList.remove("open");
+      return;
+    }
+    ensureHub();
+    var main = document.querySelector(".main.container-fluid");
+    if (main && hubEl.parentElement !== main) main.appendChild(hubEl);
+    hubEl.classList.add("open");
+    var raw = location.search || "";
+    if (raw !== PAGE_QUERY) {
+      PAGE_QUERY = raw;
+      runPageQuery();
+    }
+  }
+
+  function openHub(tab) {
+    if (location.pathname !== PAGE_PATH) {
+      var q = tab && tab !== "search" ? "?tab=" + encodeURIComponent(tab) : "";
+      location.assign(PAGE_PATH + q);
+      return;
+    }
+    syncPage();
+    activateTab(tab || "search");
+  }
+
+  function openSearch(ctx) {
+    var qs = new URLSearchParams();
+    if (ctx && ctx.id) {
+      qs.set("stash_id", String(ctx.id));
+      qs.set("kind", ctx.kind || "image");
+    }
+    location.assign(PAGE_PATH + (qs.toString() ? "?" + qs.toString() : ""));
   }
 
   function ensurePmLoaded() {
@@ -1390,7 +1518,7 @@
     var item = document.createElement("div");
     item.id = "mh-nav-item";
     item.className = "col-4 col-sm-3 col-md-2 col-lg-auto nav-link";
-    item.innerHTML = '<a href="#" class="minimal p-4 p-xl-2 d-flex d-xl-inline-block flex-column justify-content-between align-items-center btn btn-primary">' +
+    item.innerHTML = '<a href="/mh" class="minimal p-4 p-xl-2 d-flex d-xl-inline-block flex-column justify-content-between align-items-center btn btn-primary">' +
       '<svg data-prefix="fas" data-icon="magnifying-glass" class="svg-inline--fa fa-magnifying-glass fa-icon nav-menu-icon d-block d-xl-inline mb-2 mb-xl-0" role="img" viewBox="0 0 512 512" aria-hidden="true"><path fill="currentColor" d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376C296.3 401.1 253.9 416 208 416 93.1 416 0 322.9 0 208S93.1 0 208 0 416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z"></path></svg>' +
       '<span>MineHub</span></a>';
     item.querySelector("a").onclick = function (e) { e.preventDefault(); openHub("search"); };
@@ -1425,6 +1553,41 @@
     bar.appendChild(b);
   }
 
+  function injectGifNote() {
+    var m = location.pathname.match(/^\/images\/(\d+)(?:$|\/)/);
+    var panel = document.querySelector(".file-info-panel");
+    var note = document.getElementById("mh-gif-note");
+    if (!m || !panel) {
+      if (note) note.remove();
+      if (!m) GIF_INFO = null;
+      return;
+    }
+    var id = m[1];
+    if (GIF_INFO && GIF_INFO.id === id) {
+      if (!note) panel.insertBefore(GIF_INFO.node, panel.firstChild);
+      return;
+    }
+    if (note) note.remove();
+    GIF_INFO = { id: id, node: null };
+    fetch(BASE + "/media/info?kind=image&id=" + encodeURIComponent(id))
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (!GIF_INFO || GIF_INFO.id !== id) return;
+        if (!j.is_gif || Number(j.frames) > 1) return;
+        var body = document.querySelector(".file-info-panel");
+        if (!body) return;
+        var box = document.createElement("div");
+        box.id = "mh-gif-note";
+        box.innerHTML = "<strong>单帧 GIF</strong>：这个 GIF 只有一个画面，不是 MineHub 查看器故障。";
+        GIF_INFO.node = box;
+        body.insertBefore(box, body.firstChild);
+      })
+      .catch(function () {});
+  }
+
   function translateExact() {
     var map = {"File(s) Size": "文件大小", "Production Date": "制作日期"};
     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -1447,6 +1610,8 @@
     }
     injectNavItem();
     injectDetailButton();
+    injectGifNote();
+    syncPage();
     ["mh-search-btn", "mh-pm-btn", "mh-sim-btn"].forEach(function (id) {
       var e = document.getElementById(id);
       if (e) e.remove();

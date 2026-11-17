@@ -14,16 +14,16 @@
 | Stage 2 A | 完成：49,697 条（全部视频 + 图片） |
 | Stage 2 B | 完成：6,641 条（仅仲裁 explicit / 低置信度 / review） |
 | 复核 | 2,947/2,964 条 SigLIP-only explicit 用 VLM 复检；5,542 张安全二次元已搬回 QQ |
-| Stage 3 | 已移动 16,438 个 NSFW 文件，73,194 个普通文件留在 QQ 原地 |
+| Stage 3 | 已移动 16,439 个 NSFW 文件，73,193 个普通文件留在 QQ 原地 |
 | Stash | 增量扫描完成；累计 **14,139** 条 tagged；当前 492 scene + **13,568** image |
-| 缩略图审计 | 132,616 张 QQ Thumb 已扫描；已迁出 **17,980** 张 NSFW，94,481 张 SigLIP safe + 20,010 张 VLM safe；62 张 1 字节占位 PNG 无法读图；无待处理项 |
+| 缩略图审计 | 132,616 张 QQ Thumb 已扫描；已迁出 **17,982** 张 NSFW，94,472 张 SigLIP safe + 20,010 张 VLM safe；62 张 1 字节占位 PNG 无法读图；无待处理项 |
 | 增量复扫 | `mh.cli rescan` 已实测：2026-11-17 一轮耗时 122 s，迁出 2 个新 NSFW 原图 + 591 张残留 NSFW 缩略图；已修复 Stage 1 后计数未刷新导致新文件跳过 Stage 2 的问题，补入 24 个 `.null` 原图（VLM 全部判 safe，0 移动） |
 | 定向补漏 | 70 个 .null/点名文件 VLM：18 个 NSFW；490 张 GIF/.null 缩略图强制 VLM：11 个 NSFW、9 个原 GIF；257 个仅 SigLIP 的 kept GIF 逐帧 VLM：8 个 NSFW；合计新增 28 个原图 + 32 张缩略图 |
 | 第二轮复核 | 7,938 条已检查，622 条 flagged，0 错误；501 条源文件已移动、1 条源文件缺失，已归位状态 |
 | 视频时间轴 | **492/492 个场景均有 preview+sprite+vtt**（1,476 个文件 / 1.5 GB）；scene 50 已单独转码 H.264 修复，原文件备份在 `F:\MineHubData\backups\` |
 | 相似搜索 | 双索引：旧 `nsfw-siglip2`（`vectors.sqlite` / `embeddings.npy`）+ 新 `google/siglip2-base-patch16-256`（`vectors_siglip2.sqlite` / `embeddings_siglip2.npy`）；**14,060 条**，0 错误，768 维；支持图搜 + 中英文文本搜图 |
 | 访问入口 | 统一使用 `http://127.0.0.1:9999`；同源网关把 Stash 内部 `127.0.0.1:9998` 与 MineHub API `/mh/api/*` 合并在同一端口，不再需要单独打开 8765 |
-| MineHub 原生集成 | 插件 `tools\stash\plugins\minehub`：顶部「MineHub」导航、图片/场景列表默认按文件大小降序、详情页原生「找相似」按钮，以及搜索 / QQ 缓存 / 人脸聚类 / 重复检测 / 设置五个页签；中文托盘菜单可打开各库并退出 |
+| MineHub 原生集成 | 插件 `tools\stash\plugins\minehub`：顶部「MineHub」打开独立 `/mh` 页面，图片/场景列表默认按文件大小降序，详情页原生「找相似」按钮，以及搜索 / QQ 缓存 / 人脸聚类 / 重复检测 / 设置五个页签；搜索页带相似度预设、结果数预设和手动数量，单帧 GIF 会在文件信息里提示；中文托盘菜单可打开各库并退出 |
 | QQ 缓存面板 | 在 Stash 内完成扫描、聊天归属筛选、MineHub 标签筛选、照片墙/预览、移动、回收站、切换目录和重建归属索引；普通文件仍留在 QQ，不进入 Stash 库 |
 | 重复检测 | 相似图片页签已实现 256 位 aHash/dHash/pHash + BK-tree，阈值 0–40 可调并缓存；Stash 场景 pHash 距离可调（10 时 8 组/23 个场景）；完全相同文件复用账本 MD5（865 组/1,964 个）；内容相似视频尚未接入 |
 | 界面 | Stash 使用内置 `zh-CN`，品牌/标题替换为 MineHub，托盘菜单全中文；文件信息补译「文件大小」「制作日期」；备份在 `data\backups\config-20261116-192957.yml` 与 `stash-go-20261116-192957.sqlite` |
@@ -143,13 +143,17 @@ set PYTHONPATH=.
 
 ## 相似图片 / 文本搜图
 
-正常使用不需要单独启动 8765。启动托盘或 `mh.gateway` 后，打开 `http://127.0.0.1:9999`，点击顶部「MineHub」：
+正常使用不需要单独启动 8765。启动托盘或 `mh.gateway` 后，打开 `http://127.0.0.1:9999`，点击顶部「MineHub」进入独立页面 `/mh`（与短片、图片一样是普通页面，不再是全屏悬浮层）：
 
 - 输入中文或英文描述做文本搜图（原版 `google/siglip2-base-patch16-256`，运行在 CUDA）；
-- 图片/场景详情页点击「找相似」，直接查同一索引的 Top-K；
+- 相似度滑杆带预设：文本 `0.030 / 0.055 / 0.080 / 0.120 / 0.180`，图片 `0.650 / 0.750 / 0.820 / 0.900 / 0.950`，也可以继续手动拖动；
+- 结果数默认 24，可点 `24 / 48 / 100` 预设，或手动输入 1–100；
+- 图片/场景详情页点击「找相似」，会跳转到 `/mh?stash_id=<id>&kind=<image|scene>`，直接查同一索引的 Top-K；
 - 搜索结果点击后进入 MineHub 原生详情页。
 
-底层 API 统一为同源 `/mh/api/search`、`/mh/api/status`、`/mh/api/reload`。索引数据：`data\vectors_siglip2.sqlite` + `data\embeddings_siglip2.npy`；旧 `nsfw-siglip2` 索引保留在 `data\vectors.sqlite` + `data\embeddings.npy`。只读 Stash 缩略图，不复制媒体文件。`mh.cli index serve --port 8765` 仅保留为脱离 Stash 的调试入口，日常不使用。
+搜索使用 SigLIP2 图文语义向量，不是标签精确匹配：结果可能画面里有电脑，但标签列表没有「电脑」；同样，带「电脑」标签也不保证一定排在前面。
+
+底层 API 统一为同源 `/mh/api/search`、`/mh/api/status`、`/mh/api/reload`、`/mh/api/media/info`（返回图片帧数，用于单帧 GIF 标注）。索引数据：`data\vectors_siglip2.sqlite` + `data\embeddings_siglip2.npy`；旧 `nsfw-siglip2` 索引保留在 `data\vectors.sqlite` + `data\embeddings.npy`。只读 Stash 缩略图，不复制媒体文件。`mh.cli index serve --port 8765` 仅保留为脱离 Stash 的调试入口，日常不使用。
 
 ## 重复检测与阈值（对照 Krokiet/czkawka）
 
@@ -174,11 +178,13 @@ API：`/mh/api/dupes/status`、`/dupes/scan`、`/dupes/groups`、`/dupes/scenes`
 
 ## MineHub 原生集成（插件）
 
-`tools\stash\custom_minehub.js` 通过本地插件注入到 Stash，不打开独立程序窗口，也不使用 iframe：
+`tools\stash\plugins\minehub\custom_minehub.js` 通过本地插件注入到 Stash，不打开独立程序窗口，也不使用 iframe：
 
-- 顶部导航新增「MineHub」，打开与 Stash 同风格的搜索 / QQ 缓存 / 人脸聚类 / 重复检测 / 设置页签；
+- 顶部导航新增「MineHub」，打开独立 `/mh` 页面，内含搜索 / QQ 缓存 / 人脸聚类 / 重复检测 / 设置页签；
+- 搜索页带相似度预设、结果数 `24/48/100` 预设和 1–100 手动输入；调整后自动重查；
 - `/images`、`/scenes` 首次访问自动使用 `sortby=filesize&sortdir=desc`；用户手动选择的时间/名称排序会保留；
-- 图片/场景详情页工具栏显示原生「找相似」按钮；
+- 图片/场景详情页工具栏显示原生「找相似」按钮，跳转到 `/mh?stash_id=...`；
+- 图片文件信息面板若检测到单帧 GIF，会显示「单帧 GIF，不是查看器故障」；
 - QQ 缓存页签扫描 Pic/Video 或 NSFW 库，按类型、Ori/Thumb、大小、文件名、QQ 好友/群、MineHub 分类/等级/标签筛选；支持照片墙、预览、系统打开、移动和移入回收站；可切换两个 QQ 账号并重建归属索引；
 - 插件通过同源 `/mh/api/*` 调用本地服务，不再使用 `ui.csp.connect-src` 放行 8765；
 - 人脸聚类和图像 pHash 目前是保留入口，尚未执行；场景 pHash 结果已可查询。

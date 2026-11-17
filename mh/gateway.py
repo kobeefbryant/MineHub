@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from aiohttp import ClientSession, WSMsgType, web
 
 from .dupes import DuplicateStore
 from .index_server import App
+from .stash import Stash
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -50,6 +52,37 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
 
     async def status(_request: web.Request) -> web.Response:
         return web.json_response(app_state.index.status())
+
+    async def media_info(request: web.Request) -> web.Response:
+        try:
+            kind = (request.query.get("kind") or "image").strip().lower()
+            image_id = (request.query.get("id") or "").strip()
+            if kind != "image" or not image_id:
+                raise ValueError("需要 kind=image 和 id")
+            path = await asyncio.to_thread(Stash().image_path, image_id)
+            if not path:
+                return web.json_response({"error": f"图片 #{image_id} 没有文件路径"}, status=404)
+            from PIL import Image
+
+            with Image.open(path) as im:
+                frames = int(getattr(im, "n_frames", 1) or 1)
+                fmt = str(im.format or "")
+                width, height = im.size
+            suffix = Path(path).suffix.lower()
+            return web.json_response({
+                "kind": "image",
+                "id": image_id,
+                "format": fmt,
+                "suffix": suffix,
+                "frames": frames,
+                "animated": frames > 1,
+                "is_gif": suffix == ".gif" or fmt.lower() == "gif",
+                "width": width,
+                "height": height,
+            })
+        except Exception as exc:  # noqa: BLE001
+            code, body = _error(exc)
+            return web.json_response(body, status=code)
 
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
@@ -257,6 +290,7 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
     app = web.Application(client_max_size=512 * 1024 * 1024)
     app.router.add_get("/mh/api/health", health)
     app.router.add_get("/mh/api/status", status)
+    app.router.add_get("/mh/api/media/info", media_info)
     app.router.add_post("/mh/api/search", search)
     app.router.add_post("/mh/api/reload", reload)
     app.router.add_post("/mh/api/reload-labels", reload_labels)
