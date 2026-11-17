@@ -200,11 +200,17 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
     async def dupes_scan(request: web.Request) -> web.Response:
         try:
             payload = await _json_body(request)
+            scope = str(payload.get("scope") or "library")
+            root = str(payload.get("root") or "").strip()
+            recursive = bool(payload.get("recursive", True))
+            if scope == "folder":
+                if not root:
+                    root = str((await asyncio.to_thread(dupes.status, "folder")).get("root") or "")
+                if root:
+                    root = manager.allow_root(root)
             return web.json_response(await asyncio.to_thread(
-                dupes.start,
-                str(payload.get("scope") or "library"),
-                int(payload.get("limit") or 0),
-                bool(payload.get("force")),
+                dupes.start, scope, int(payload.get("limit") or 0),
+                bool(payload.get("force")), root, recursive,
             ))
         except Exception as exc:  # noqa: BLE001
             code, body = _error(exc)
@@ -213,11 +219,15 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
     async def dupes_groups(request: web.Request) -> web.Response:
         try:
             payload = await _json_body(request)
+            scope = str(payload.get("scope") or "library")
+            if scope == "folder":
+                root = str((await asyncio.to_thread(dupes.status, "folder")).get("root") or "")
+                if root:
+                    manager.allow_root(root)
             return web.json_response(await asyncio.to_thread(
-                dupes.groups,
-                str(payload.get("scope") or "library"),
-                str(payload.get("algo") or "ahash"),
-                int(payload.get("threshold") or 10),
+                dupes.groups, scope,
+                str(payload.get("algo") or "phash"),
+                int(payload.get("threshold", 10)),
                 int(payload.get("limit") or 60),
             ))
         except Exception as exc:  # noqa: BLE001
@@ -229,7 +239,7 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
             payload = await _json_body(request)
             return web.json_response(await asyncio.to_thread(
                 dupes.scenes,
-                int(payload.get("distance") or 10),
+                int(payload.get("distance", 10)),
                 int(payload.get("limit") or 60),
             ))
         except Exception as exc:  # noqa: BLE001

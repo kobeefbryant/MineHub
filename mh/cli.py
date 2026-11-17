@@ -138,6 +138,8 @@ def cmd_index(args: argparse.Namespace) -> None:
         from .index_server import serve
 
         serve(args.port, args.device, args.model)
+    elif args.stage == "refresh":
+        print(json.dumps(idx.refresh_metadata(), ensure_ascii=False, indent=1))
     else:
         print(json.dumps(idx.status(), ensure_ascii=False, indent=1))
 
@@ -233,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_reaudit)
 
     p = sub.add_parser("index")
-    p.add_argument("stage", choices=["build", "search", "serve", "status"])
+    p.add_argument("stage", choices=["build", "search", "serve", "refresh", "status"])
     p.add_argument("--kind", choices=["images", "scenes", "all", "image", "scene"], default="all")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=32)

@@ -1,4 +1,4 @@
-"""Perceptual duplicate detection with cached 256-bit hashes and adjustable thresholds."""
+"""Perceptual duplicate detection for images and videos with adjustable thresholds."""
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ from urllib.parse import quote
 import numpy as np
 from PIL import Image, ImageOps
 
-from .config import DATA, IMAGE_EXTS, LIBRARY, QQ_ACCOUNTS
+from .config import DATA, IMAGE_EXTS, LIBRARY, QQ_ACCOUNTS, VIDEO_EXTS
 from .manager import _find_thumb
 
 DUPES_DB = DATA / "dupes.sqlite"
@@ -20,7 +20,8 @@ HASH_SIZE = 16
 HASH_BITS = HASH_SIZE * HASH_SIZE
 MAX_THRESHOLD = 40
 ALGOS = ("ahash", "dhash", "phash")
-SCOPES = ("library", "qq")
+SCOPES = ("library", "qq", "folder")
+VIDEO_FRAMES = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -35,11 +36,13 @@ CREATE TABLE IF NOT EXISTS items (
     ahash     TEXT,
     dhash     TEXT,
     phash     TEXT,
+    frames    TEXT,
     error     TEXT,
     hashed_at REAL,
     PRIMARY KEY(scope, path)
 );
 CREATE INDEX IF NOT EXISTS idx_dupes_scope ON items(scope);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 
 _DCT = None
@@ -93,10 +96,36 @@ def hash_file(path: str | Path) -> dict:
             width, height = im.size
             gray = im.convert("L")
             hashes = _hash_arrays(gray)
-        return {"width": width, "height": height, **hashes, "error": "", "seconds": time.time() - started}
+        return {"width": width, "height": height, **hashes, "frames": "",
+                "error": "", "seconds": time.time() - started}
     except Exception as exc:  # noqa: BLE001
         return {"width": 0, "height": 0, "ahash": "", "dhash": "", "phash": "",
-                "error": str(exc)[:200], "seconds": time.time() - started}
+                "frames": "", "error": str(exc)[:200], "seconds": time.time() - started}
+
+
+def hash_video(path: str | Path, count: int = VIDEO_FRAMES) -> dict:
+    started = time.time()
+    from .frames import cleanup_frames, extract_frames
+
+    frames = extract_frames(path, count=count, max_side=512)
+    try:
+        hashes: list[str] = []
+        width = 0
+        height = 0
+        for frame in frames:
+            result = hash_file(frame)
+            signature = result.get("phash") or result.get("dhash") or result.get("ahash")
+            if signature:
+                hashes.append(signature)
+                width = width or int(result.get("width") or 0)
+                height = height or int(result.get("height") or 0)
+        if not hashes:
+            return {"width": 0, "height": 0, "ahash": "", "dhash": "", "phash": "",
+                    "frames": "", "error": "无法从视频提取关键帧", "seconds": time.time() - started}
+        return {"width": width, "height": height, "ahash": "", "dhash": "", "phash": "",
+                "frames": ",".join(hashes), "error": "", "seconds": time.time() - started}
+    finally:
+        cleanup_frames(frames)
 
 
 class BKTree:
@@ -160,12 +189,31 @@ class DuplicateStore:
         DATA.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.executescript(SCHEMA)
+            columns = {row[1] for row in con.execute("PRAGMA table_info(items)")}
+            if "frames" not in columns:
+                con.execute("ALTER TABLE items ADD COLUMN frames TEXT")
 
     def _conn(self) -> sqlite3.Connection:
         con = sqlite3.connect(DUPES_DB, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA journal_mode=WAL")
         return con
+
+    def _setting(self, key: str, default: str = "") -> str:
+        con = self._conn()
+        try:
+            row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+        finally:
+            con.close()
+
+    def _save_setting(self, key: str, value: str) -> None:
+        con = self._conn()
+        try:
+            con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+            con.commit()
+        finally:
+            con.close()
 
     # ---------- scans ----------
     def status(self, scope: str = "library") -> dict:
@@ -175,7 +223,8 @@ class DuplicateStore:
         try:
             total = con.execute("SELECT COUNT(*) FROM items WHERE scope=?", (scope,)).fetchone()[0]
             hashed = con.execute(
-                "SELECT COUNT(*) FROM items WHERE scope=? AND (ahash!='' OR dhash!='' OR phash!='')",
+                "SELECT COUNT(*) FROM items WHERE scope=? AND "
+                "(ahash!='' OR dhash!='' OR phash!='' OR frames!='')",
                 (scope,),
             ).fetchone()[0]
             errors = con.execute(
@@ -184,26 +233,66 @@ class DuplicateStore:
             latest = con.execute(
                 "SELECT MAX(hashed_at) FROM items WHERE scope=?", (scope,)
             ).fetchone()[0] or 0
+            counts = {row["kind"]: row["n"] for row in con.execute(
+                "SELECT kind, COUNT(*) AS n FROM items WHERE scope=? GROUP BY kind", (scope,)
+            )}
         finally:
             con.close()
+        root = self._setting("folder_root") if scope == "folder" else ""
+        recursive = self._setting("folder_recursive", "1") == "1"
         return {"scope": scope, "items": total, "hashed": hashed, "errors": errors,
                 "hashed_at": latest, "job": job, "algorithms": list(ALGOS),
-                "max_threshold": MAX_THRESHOLD, "hash_bits": HASH_BITS}
+                "max_threshold": MAX_THRESHOLD, "hash_bits": HASH_BITS,
+                "root": root, "recursive": recursive,
+                "images": int(counts.get("image", 0)), "videos": int(counts.get("video", 0))}
 
-    def start(self, scope: str = "library", limit: int = 0, force: bool = False) -> dict:
+    def start(self, scope: str = "library", limit: int = 0, force: bool = False,
+              root: str = "", recursive: bool = True) -> dict:
         if scope not in SCOPES:
             raise ValueError(f"unknown scope: {scope}")
+        root_path: Path | None = None
+        if scope == "folder":
+            raw = str(root or "").strip() or self._setting("folder_root")
+            if not raw:
+                raise ValueError("需要指定要扫描的文件夹")
+            root_path = Path(raw).expanduser().resolve()
+            if not root_path.is_dir():
+                raise ValueError(f"文件夹不存在：{root_path}")
+            if root_path.parent == root_path:
+                raise ValueError("请不要扫描磁盘根目录")
+            self._save_setting("folder_root", str(root_path))
+            self._save_setting("folder_recursive", "1" if recursive else "0")
         with self.lock:
             if self.job.get("status") == "running":
                 return dict(self.job)
             self.job = {"status": "running", "scope": scope, "done": 0, "total": 0,
-                        "errors": 0, "started_at": time.time()}
-        threading.Thread(target=self._scan, args=(scope, max(0, limit), bool(force)), daemon=True).start()
+                        "errors": 0, "started_at": time.time(),
+                        "root": str(root_path or ""), "recursive": bool(recursive)}
+        threading.Thread(target=self._scan, args=(scope, max(0, limit), bool(force),
+                                                  root_path, bool(recursive)), daemon=True).start()
         return dict(self.job)
 
-    def _paths(self, scope: str) -> list[Path]:
+    def _paths(self, scope: str, root: Path | None = None, recursive: bool = True) -> list[Path]:
         if scope == "library":
             return [p for p in LIBRARY.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+        if scope == "folder":
+            if root is None or not root.is_dir():
+                return []
+            out: list[Path] = []
+            if recursive:
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                    for name in filenames:
+                        ext = Path(name).suffix.lower()
+                        if ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+                            out.append(Path(dirpath) / name)
+            else:
+                for entry in os.scandir(root):
+                    if entry.is_file(follow_symlinks=False):
+                        ext = Path(entry.name).suffix.lower()
+                        if ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+                            out.append(Path(entry.path))
+            return out
         out: list[Path] = []
         for nt_data in QQ_ACCOUNTS:
             root = nt_data / "Pic"
@@ -214,15 +303,19 @@ class DuplicateStore:
                     out.append(p)
         return out
 
-    def _scan(self, scope: str, limit: int, force: bool) -> None:
+    def _scan(self, scope: str, limit: int, force: bool,
+              root: Path | None = None, recursive: bool = True) -> None:
         try:
-            paths = self._paths(scope)
+            paths = self._paths(scope, root, recursive)
             if limit:
                 paths = paths[:limit]
             con = self._conn()
             existing = {
                 r["path"]: r
-                for r in con.execute("SELECT path,size,mtime,ahash,dhash,phash,error FROM items WHERE scope=?", (scope,))
+                for r in con.execute(
+                    "SELECT path,size,mtime,kind,ahash,dhash,phash,frames,error "
+                    "FROM items WHERE scope=?", (scope,)
+                )
             }
             with self.lock:
                 self.job.update({"total": len(paths), "done": 0, "errors": 0})
@@ -236,26 +329,36 @@ class DuplicateStore:
             pending: list[tuple] = []
             hashed_this_round = 0
 
-            def hash_one(path: Path) -> tuple[Path, dict, bool]:
+            def hash_one(path: Path) -> tuple[Path, str, dict, bool]:
+                kind = "video" if path.suffix.lower() in VIDEO_EXTS else "image"
                 row = existing.get(str(path))
+                cached_hash = bool(row and (row["frames"] if kind == "video"
+                                           else (row["ahash"] or row["dhash"] or row["phash"])))
                 if (not force and row is not None and row["size"] == path.stat().st_size
                         and abs(float(row["mtime"]) - path.stat().st_mtime) < 1e-6
-                        and (row["ahash"] or row["dhash"] or row["phash"])):
-                    return path, {}, True
+                        and cached_hash):
+                    return path, kind, {}, True
                 source = path
-                if scope == "qq":
+                if scope == "qq" and kind == "image":
                     thumb = _find_thumb(str(path))
                     if thumb is not None:
                         source = thumb
-                result = hash_file(source)
-                return path, result, False
+                result = hash_video(source) if kind == "video" else hash_file(source)
+                if kind == "image" and path.suffix.lower() == ".null" and result.get("error"):
+                    video_result = hash_video(source)
+                    if not video_result.get("error"):
+                        kind = "video"
+                        result = video_result
+                return path, kind, result, False
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            workers = 2 if scope == "folder" else 4
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(hash_one, p): p for p in paths}
                 for future in as_completed(futures):
                     path = futures[future]
+                    kind = "video" if path.suffix.lower() in VIDEO_EXTS else "image"
                     try:
-                        path, result, cached = future.result()
+                        path, kind, result, cached = future.result()
                         if cached:
                             done += 1
                             with self.lock:
@@ -264,9 +367,9 @@ class DuplicateStore:
                         st = path.stat()
                         pending.append((
                             scope, str(path), path.name, st.st_size, st.st_mtime,
-                            "image", result.get("width", 0), result.get("height", 0),
+                            kind, result.get("width", 0), result.get("height", 0),
                             result.get("ahash", ""), result.get("dhash", ""), result.get("phash", ""),
-                            result.get("error", ""), time.time(),
+                            result.get("frames", ""), result.get("error", ""), time.time(),
                         ))
                         hashed_this_round += 1
                         if result.get("error"):
@@ -274,19 +377,20 @@ class DuplicateStore:
                     except Exception as exc:  # noqa: BLE001
                         errors += 1
                         pending.append((
-                            scope, str(path), path.name, 0, 0, "image", 0, 0,
-                            "", "", "", str(exc)[:200], time.time(),
+                            scope, str(path), path.name, 0, 0, kind, 0, 0,
+                            "", "", "", "", str(exc)[:200], time.time(),
                         ))
                     done += 1
                     if len(pending) >= 200:
                         con.executemany(
                             """INSERT INTO items(scope,path,name,size,mtime,kind,width,height,
-                               ahash,dhash,phash,error,hashed_at)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               ahash,dhash,phash,frames,error,hashed_at)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                                ON CONFLICT(scope,path) DO UPDATE SET
                                size=excluded.size,mtime=excluded.mtime,width=excluded.width,
                                height=excluded.height,ahash=excluded.ahash,dhash=excluded.dhash,
-                               phash=excluded.phash,error=excluded.error,hashed_at=excluded.hashed_at""",
+                               phash=excluded.phash,frames=excluded.frames,
+                               error=excluded.error,hashed_at=excluded.hashed_at""",
                             pending,
                         )
                         con.commit()
@@ -296,12 +400,13 @@ class DuplicateStore:
             if pending:
                 con.executemany(
                     """INSERT INTO items(scope,path,name,size,mtime,kind,width,height,
-                       ahash,dhash,phash,error,hashed_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ahash,dhash,phash,frames,error,hashed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(scope,path) DO UPDATE SET
                        size=excluded.size,mtime=excluded.mtime,width=excluded.width,
                        height=excluded.height,ahash=excluded.ahash,dhash=excluded.dhash,
-                       phash=excluded.phash,error=excluded.error,hashed_at=excluded.hashed_at""",
+                       phash=excluded.phash,frames=excluded.frames,
+                       error=excluded.error,hashed_at=excluded.hashed_at""",
                     pending,
                 )
                 con.commit()
@@ -336,14 +441,150 @@ class DuplicateStore:
         self._stash_at = time.time()
         return mapping
 
-    def groups(self, scope: str = "library", algo: str = "ahash",
+    @staticmethod
+    def _video_signature(raw: str) -> list[int]:
+        out: list[int] = []
+        for value in str(raw or "").split(","):
+            value = value.strip()
+            if not value:
+                continue
+            try:
+                out.append(int(value, 16))
+            except ValueError:
+                continue
+        return out
+
+    @staticmethod
+    def _video_distance(left: list[int], right: list[int]) -> int:
+        size = min(len(left), len(right))
+        if size == 0:
+            return MAX_THRESHOLD + 1
+        return max((left[i] ^ right[i]).bit_count() for i in range(size))
+
+    def _member(self, row: dict, distance: int | None, stash: dict[str, dict]) -> dict:
+        mapped = stash.get(_norm(row["path"]), {})
+        kind = row.get("kind") or "image"
+        return {
+            "path": row["path"], "name": row["name"], "size": row["size"],
+            "width": row["width"], "height": row["height"], "kind": kind,
+            "distance": distance, "thumb_url": _thumb_url(row["path"]),
+            "stash_id": mapped.get("stash_id", ""),
+            "page_url": (f"/{ 'images' if mapped.get('kind') == 'image' else 'scenes' }/{mapped['stash_id']}"
+                         if mapped.get("stash_id") else ""),
+        }
+
+    def _group_images(self, rows: list[dict], threshold: int,
+                      stash: dict[str, dict]) -> list[dict]:
+        by_hash: dict[int, list[dict]] = {}
+        valid: list[dict] = []
+        for row in rows:
+            try:
+                value = int(row["hash"], 16)
+            except (TypeError, ValueError):
+                continue
+            row["h"] = value
+            by_hash.setdefault(value, []).append(row)
+            valid.append(row)
+        if not valid:
+            return []
+        tree = BKTree()
+        for value in by_hash:
+            tree.add(value)
+        assigned: set[str] = set()
+        groups_out: list[dict] = []
+        for row in sorted(valid, key=lambda r: (-int(r["size"] or 0), r["path"])):
+            if row["path"] in assigned:
+                continue
+            matches = tree.search(row["h"], threshold)
+            matches.sort(key=lambda x: x[0])
+            cluster = [row]
+            cluster_paths = {row["path"]}
+            for _distance, value in matches:
+                for other in by_hash.get(value, []):
+                    if other["path"] in assigned or other["path"] in cluster_paths:
+                        continue
+                    if all(((other["h"] ^ member["h"]).bit_count() <= threshold)
+                           for member in cluster):
+                        cluster.append(other)
+                        cluster_paths.add(other["path"])
+            if len(cluster) < 2:
+                continue
+            for item in cluster:
+                assigned.add(item["path"])
+            ordered = [row] + [item for item in cluster if item["path"] != row["path"]]
+            ordered.sort(key=lambda item: ((item["h"] ^ row["h"]).bit_count(),
+                                            -int(item["size"] or 0)))
+            ordered = [row] + [item for item in ordered if item["path"] != row["path"]]
+            members = [self._member(item, (item["h"] ^ row["h"]).bit_count(), stash)
+                       for item in ordered]
+            groups_out.append({
+                "representative": members[0],
+                "members": members[1:],
+                "count": len(members),
+                "total_size": sum(int(item["size"] or 0) for item in members),
+                "max_distance": max(item["distance"] for item in members),
+                "kind": "image",
+            })
+        return groups_out
+
+    def _group_videos(self, rows: list[dict], threshold: int,
+                      stash: dict[str, dict]) -> list[dict]:
+        videos: list[dict] = []
+        for row in rows:
+            signature = self._video_signature(row.get("frames", ""))
+            if not signature:
+                continue
+            row["sig"] = signature
+            videos.append(row)
+        assigned: set[str] = set()
+        groups_out: list[dict] = []
+        for row in sorted(videos, key=lambda item: (-int(item["size"] or 0), item["path"])):
+            if row["path"] in assigned:
+                continue
+            candidates: list[tuple[int, dict]] = []
+            for other in videos:
+                if other is row or other["path"] in assigned:
+                    continue
+                distance = self._video_distance(row["sig"], other["sig"])
+                if distance <= threshold:
+                    candidates.append((distance, other))
+            candidates.sort(key=lambda item: (item[0], item[1]["path"]))
+            cluster = [row]
+            cluster_paths = {row["path"]}
+            for distance, other in candidates:
+                if any(self._video_distance(other["sig"], item["sig"]) > threshold
+                       for item in cluster):
+                    continue
+                cluster.append(other)
+                cluster_paths.add(other["path"])
+            if len(cluster) < 2:
+                continue
+            for item in cluster:
+                assigned.add(item["path"])
+            ordered = [row] + [item for item in cluster if item["path"] != row["path"]]
+            ordered.sort(key=lambda item: (self._video_distance(item["sig"], row["sig"]),
+                                            -int(item["size"] or 0)))
+            ordered = [row] + [item for item in ordered if item["path"] != row["path"]]
+            members = [self._member(item, self._video_distance(item["sig"], row["sig"]), stash)
+                       for item in ordered]
+            groups_out.append({
+                "representative": members[0],
+                "members": members[1:],
+                "count": len(members),
+                "total_size": sum(int(item["size"] or 0) for item in members),
+                "max_distance": max(item["distance"] for item in members),
+                "kind": "video",
+            })
+        return groups_out
+
+    def groups(self, scope: str = "library", algo: str = "phash",
                threshold: int = 10, limit: int = 60) -> dict:
         if scope not in SCOPES:
             raise ValueError(f"unknown scope: {scope}")
         if algo not in ALGOS:
             raise ValueError(f"unknown algorithm: {algo}")
         threshold = max(0, min(MAX_THRESHOLD, int(threshold)))
-        key = (scope, algo, threshold, self.version)
+        key = (scope, algo, threshold, self.version, self._setting("folder_root"))
         with self.lock:
             cached = self._group_cache.get(key)
         if cached is not None:
@@ -352,62 +593,23 @@ class DuplicateStore:
         con = self._conn()
         try:
             rows = [dict(r) for r in con.execute(
-                f"SELECT path,name,size,mtime,width,height,{algo} AS hash FROM items "
-                "WHERE scope=? AND error='' AND {algo}!=''".format(algo=algo),
+                f"SELECT path,name,kind,size,mtime,width,height,{algo} AS hash,frames "
+                "FROM items WHERE scope=? AND error=''",
                 (scope,),
             )]
         finally:
             con.close()
-        by_hash: dict[int, list[dict]] = {}
-        for row in rows:
-            try:
-                value = int(row["hash"], 16)
-            except (TypeError, ValueError):
-                continue
-            row["h"] = value
-            by_hash.setdefault(value, []).append(row)
-        tree = BKTree()
-        for h in by_hash:
-            tree.add(h)
-        assigned: set[str] = set()
+        image_rows = [row for row in rows if row.get("kind") != "video" and row.get("hash")]
+        video_rows = [row for row in rows if row.get("kind") == "video" and row.get("frames")]
         stash = self._stash_paths()
-        groups_out: list[dict] = []
-        for row in sorted(rows, key=lambda r: (-int(r["size"] or 0), r["path"])):
-            if row["path"] in assigned:
-                continue
-            matches = tree.search(row["h"], threshold)
-            matches.sort(key=lambda x: x[0])
-            rep = row
-            members: list[dict] = []
-            for distance, h in matches:
-                for other in by_hash.get(h, []):
-                    if other["path"] in assigned:
-                        continue
-                    assigned.add(other["path"])
-                    mapped = stash.get(_norm(other["path"]), {})
-                    members.append({
-                        "path": other["path"], "name": other["name"], "size": other["size"],
-                        "width": other["width"], "height": other["height"],
-                        "distance": int(distance), "thumb_url": _thumb_url(other["path"]),
-                        "stash_id": mapped.get("stash_id", ""),
-                        "page_url": (f"/{ 'images' if mapped.get('kind') == 'image' else 'scenes' }/{mapped['stash_id']}"
-                                     if mapped.get("stash_id") else ""),
-                    })
-            if len(members) < 2:
-                continue
-            members.sort(key=lambda x: (x["distance"], -int(x["size"] or 0)))
-            groups_out.append({
-                "representative": members[0],
-                "members": members[1:],
-                "count": len(members),
-                "total_size": sum(int(m["size"] or 0) for m in members),
-                "max_distance": max(m["distance"] for m in members),
-            })
-        groups_out.sort(key=lambda g: (-g["total_size"], -g["count"]))
-        result = {"scope": scope, "algo": algo, "threshold": threshold,
+        groups_out = self._group_images(image_rows, threshold, stash)
+        groups_out += self._group_videos(video_rows, threshold, stash)
+        groups_out.sort(key=lambda group: (-group["total_size"], -group["count"]))
+        root = self._setting("folder_root") if scope == "folder" else ""
+        result = {"scope": scope, "algo": algo, "threshold": threshold, "root": root,
                   "groups": groups_out, "total_groups": len(groups_out),
-                  "total_files": sum(g["count"] for g in groups_out),
-                  "hashed": len(rows)}
+                  "total_files": sum(group["count"] for group in groups_out),
+                  "hashed": len(rows), "images": len(image_rows), "videos": len(video_rows)}
         with self.lock:
             if len(self._group_cache) > 8:
                 self._group_cache.clear()

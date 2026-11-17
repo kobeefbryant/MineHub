@@ -115,8 +115,8 @@ class Stash:
         (plugin_dir / "custom_minehub.js").write_text(Path(path).read_text(encoding="utf-8"), encoding="utf-8")
         (plugin_dir / "minehub.yml").write_text(
             """name: MineHub Native Search
-description: MineHub text search, QQ cache and similarity entry points served through the same-origin gateway.
-version: 1.0.3
+description: MineHub media intelligence for Stash: semantic image/text search, duplicate detection, native preview, and optional QQ cache import.
+version: 1.0.5
 ui:
   javascript:
     - custom_minehub.js

@@ -268,9 +268,70 @@
     rerunWithOptions();
   }
 
+  function currentMode() {
+    var el = document.getElementById("mh-mode");
+    return el && el.value === "regex" ? "regex" : "semantic";
+  }
+
+  function currentKind() {
+    var el = document.getElementById("mh-kind");
+    var value = el ? el.value : "all";
+    return value === "image" || value === "scene" ? value : "all";
+  }
+
+  function currentMatch() {
+    var el = document.getElementById("mh-match");
+    return el && el.value === "any" ? "any" : "all";
+  }
+
+  function updateModeUI() {
+    var mode = currentMode();
+    var regex = mode === "regex";
+    var scoreRow = document.getElementById("mh-score-row");
+    var presets = document.getElementById("mh-regex-presets");
+    var ignore = document.getElementById("mh-ignore-wrap");
+    var input = document.getElementById("mh-q");
+    var sep = document.getElementById("mh-sep-hint");
+    if (scoreRow) scoreRow.classList.toggle("mh-hidden", regex);
+    if (presets) presets.classList.toggle("open", regex);
+    if (ignore) ignore.style.display = regex ? "" : "none";
+    if (input) {
+      input.placeholder = regex
+        ? "正则表达式；多个用；或,分隔，例如 电脑|显示器"
+        : "中文/英文描述；多个关键词用；或,分隔";
+      input.title = regex
+        ? "按文件名、路径、标签和 ID 做正则匹配；不区分大小写可关闭"
+        : "SigLIP2 语义搜索；多个关键词按“全部/任一”组合";
+    }
+    if (sep) sep.textContent = regex
+      ? "多正则：； ; 换行（| 保留为或）"
+      : "分隔：； ; ， , 、 | 换行";
+  }
+
+  function baseName(path) {
+    var value = String(path || "").replace(/\//g, "\\");
+    return value.split("\\").pop() || "";
+  }
+
   function rerunWithOptions() {
     if (!LAST_SEARCH) return;
-    LAST_SEARCH = Object.assign({}, LAST_SEARCH, { min_score: scoreValue(), top: topValue() });
+    var next = Object.assign({}, LAST_SEARCH, { top: topValue() });
+    if (LAST_SEARCH.stash_id) {
+      next.min_score = scoreValue();
+    } else {
+      next.kind = currentKind();
+      next.match = currentMatch();
+      next.mode = currentMode();
+      if (next.mode === "regex") {
+        delete next.min_score;
+        var input = document.getElementById("mh-q");
+        next.text = input ? input.value.trim() : (next.text || "");
+        if (!next.text) return;
+      } else {
+        next.min_score = scoreValue();
+      }
+    }
+    LAST_SEARCH = next;
     clearTimeout(scoreTimer);
     scoreTimer = setTimeout(function () { if (LAST_SEARCH) doSearch(LAST_SEARCH); }, 250);
   }
@@ -354,9 +415,41 @@
     if (!text) { setStatus("请输入搜索描述"); return; }
     var hint = document.getElementById("mh-search-hint");
     if (hint) hint.style.display = "none";
-    setScoreRange("text");
-    document.getElementById("mh-title").textContent = "MineHub 搜索";
-    doSearch({ text: text, top: topValue(), min_score: scoreValue() });
+    var mode = currentMode();
+    var payload = {
+      mode: mode,
+      text: text,
+      top: topValue(),
+      kind: currentKind(),
+      match: currentMatch()
+    };
+    if (mode === "regex") {
+      payload.ignore_case = !document.getElementById("mh-ignore-case") ||
+        document.getElementById("mh-ignore-case").checked;
+    } else {
+      setScoreRange("text");
+      payload.min_score = scoreValue();
+    }
+    document.getElementById("mh-title").textContent =
+      mode === "regex" ? "MineHub 正则搜索" : "MineHub 搜索";
+    doSearch(payload);
+  }
+
+  function cardCaption(item, payload) {
+    var label = item.kind === "scene" ? "场景" : "图片";
+    var score = Number(item.score);
+    if (payload.mode === "regex" || item.score == null || !Number.isFinite(score)) {
+      var name = item.title || baseName(item.source_path);
+      return label + " #" + item.stash_id + (name ? " · " + name : "");
+    }
+    return label + " #" + item.stash_id + " · " + score.toFixed(3);
+  }
+
+  function cardFields(item) {
+    var parts = [];
+    if (item.source_path) parts.push(item.source_path);
+    if (item.tags) parts.push(item.tags);
+    return parts.join("\n");
   }
 
   function doSearch(payload) {
@@ -386,37 +479,59 @@
         return !SEARCH_DELETED[x.kind + "|" + x.stash_id];
       });
       var cutoff = Number(payload.min_score);
-      var cutoffText = Number.isFinite(cutoff) ? " · 相似度 ≥ " + cutoff.toFixed(3) : "";
-      setStatus(rows.length ? ("共 " + rows.length + " 个结果" + cutoffText) : ("没有找到结果" + cutoffText));
+      var isRegex = payload.mode === "regex";
+      var cutoffText = isRegex ? " · 正则匹配" :
+        (Number.isFinite(cutoff) ? " · 相似度 ≥ " + cutoff.toFixed(3) : "");
+      var kindText = payload.kind === "image" ? " · 仅图片" :
+        (payload.kind === "scene" ? " · 仅场景" : "");
+      setStatus(rows.length ? ("共 " + rows.length + " 个结果" + cutoffText + kindText) :
+        ("没有找到结果" + cutoffText + kindText));
       rows.forEach(function (x) {
         var key = x.kind + "|" + x.stash_id;
         SEARCH_ITEMS[key] = x;
-        var a = document.createElement("a");
-        a.className = "mh-card";
-        a.href = x.page_url;
-        a.dataset.mhKey = key;
-        a.title = (x.kind === "scene" ? "场景" : "图片") + " #" + x.stash_id;
-        var chk = document.createElement("input");
-        chk.type = "checkbox";
-        chk.className = "mh-card-check";
-        chk.title = "选择此结果";
-        chk.onclick = function (ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          toggleSearchSelection(key, chk.checked, a);
-        };
+        var card = document.createElement("div");
+        card.className = "mh-card";
+        card.dataset.mhKey = key;
+        var link = document.createElement("a");
+        link.className = "mh-card-main";
+        link.href = x.page_url;
+        link.title = cardFields(x) || ((x.kind === "scene" ? "场景" : "图片") + " #" + x.stash_id);
         var img = document.createElement("img");
         img.loading = "lazy";
         img.src = x.thumbnail_url;
         img.alt = "";
         var cap = document.createElement("span");
-        var score = Number(x.score);
-        cap.textContent = (x.kind === "scene" ? "场景" : "图片") + " #" + x.stash_id +
-          (Number.isFinite(score) ? " · " + score.toFixed(3) : "");
-        a.appendChild(img);
-        a.appendChild(cap);
-        a.appendChild(chk);
-        results.appendChild(a);
+        cap.textContent = cardCaption(x, payload);
+        link.appendChild(img);
+        link.appendChild(cap);
+        card.appendChild(link);
+        var preview = document.createElement("a");
+        preview.className = "mh-card-preview";
+        preview.href = x.page_url;
+        preview.target = "_blank";
+        preview.rel = "noopener";
+        preview.title = "在 Stash 原生页面预览";
+        preview.setAttribute("aria-label", "在 Stash 原生页面预览");
+        preview.innerHTML = '<svg data-prefix="fas" data-icon="magnifying-glass" class="svg-inline--fa fa-magnifying-glass fa-icon" role="img" viewBox="0 0 512 512" aria-hidden="true"><path fill="currentColor" d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376C296.3 401.1 253.9 416 208 416 93.1 416 0 322.9 0 208S93.1 0 208 0 416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z"></path></svg>';
+        card.appendChild(preview);
+        var wrap = document.createElement("label");
+        wrap.className = "mh-card-check-wrap";
+        wrap.title = "选择此结果";
+        var chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.className = "mh-card-check";
+        chk.title = "选择此结果";
+        chk.onclick = function (ev) {
+          ev.stopPropagation();
+          toggleSearchSelection(key, chk.checked, card);
+        };
+        var tick = document.createElement("span");
+        tick.className = "mh-card-check-tick";
+        tick.textContent = "✓";
+        wrap.appendChild(chk);
+        wrap.appendChild(tick);
+        card.appendChild(wrap);
+        results.appendChild(card);
       });
     }).catch(function (e) {
       setStatus(e.name === "AbortError" ? "搜索超时，请确认 MineHub 服务正在运行" :
@@ -892,21 +1007,30 @@
   }
 
   function dupeValues() {
+    var recursive = document.getElementById("mh-dupe-recursive");
     return {
       mode: pmValue("mh-dupe-mode") || "similar",
       scope: pmValue("mh-dupe-scope") || "library",
-      algo: pmValue("mh-dupe-algo") || "ahash",
+      algo: pmValue("mh-dupe-algo") || "phash",
       threshold: Number(pmValue("mh-dupe-threshold") || 10),
+      root: (pmValue("mh-dupe-root") || "").trim(),
+      recursive: !!(recursive && recursive.checked),
       limit: 60
     };
   }
 
   function dupeUpdateScopeControls() {
     var v = dupeValues();
-    var hide = v.mode === "exact" || v.scope === "scene";
+    var exact = v.mode === "exact";
+    var hide = exact || v.scope === "scene";
+    var folder = !exact && v.scope === "folder";
     ["mh-dupe-algo-wrap", "mh-dupe-scan-wrap"].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.style.display = hide ? "none" : "";
+    });
+    ["mh-dupe-folder-wrap", "mh-dupe-recursive-wrap"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = folder ? "" : "none";
     });
   }
 
@@ -941,6 +1065,32 @@
       });
       return;
     }
+    if (v.scope === "folder") {
+      dupeSetStatus("读取文件夹状态…");
+      pmFetch("/dupes/status?scope=folder", undefined).then(function (s) {
+        var input = document.getElementById("mh-dupe-root");
+        if (input && !input.value && s.root) input.value = s.root;
+        if (s.job && s.job.status === "running") {
+          dupePoll("folder");
+          return;
+        }
+        if (!s.hashed) {
+          if (hint) hint.style.display = "";
+          var host = document.getElementById("mh-dupe-results");
+          if (host) host.textContent = "";
+          dupeSetStatus(s.root ? ("已选文件夹尚未扫描：" + s.root) : "请输入文件夹路径，然后点击「扫描并计算」");
+          return;
+        }
+        pmFetch("/dupes/groups", v).then(function (data) {
+          dupeRenderSimilar(data);
+        }).catch(function (e) {
+          dupeSetStatus("分组失败：" + e.message);
+        });
+      }).catch(function (e) {
+        dupeSetStatus("读取文件夹状态失败：" + e.message);
+      });
+      return;
+    }
     dupeSetStatus("正在分组…");
     pmFetch("/dupes/groups", v).then(function (data) {
       dupeRenderSimilar(data);
@@ -967,8 +1117,9 @@
     }
     if (big) {
       var meta = document.createElement("div");
-      meta.textContent = "大小 " + fmtSize(item.size) + " · " + (item.width || "?") + "×" + (item.height || "?") +
-        (item.distance === null || item.distance === undefined ? " · Stash pHash 组" : " · 距代表图 " + item.distance);
+      meta.textContent = (item.kind === "video" ? "视频 · 5 帧 pHash" : "图片") +
+        " · 大小 " + fmtSize(item.size) + " · " + (item.width || "?") + "×" + (item.height || "?") +
+        (item.distance === null || item.distance === undefined ? " · Stash pHash 组" : " · 距代表 " + item.distance);
       info.appendChild(meta);
       var path = document.createElement("div");
       path.className = "text-muted";
@@ -992,7 +1143,8 @@
       info.appendChild(actions);
     } else {
       var sub = document.createElement("span");
-      sub.textContent = (item.distance === null || item.distance === undefined ? "场景组" : "距离 " + item.distance) +
+      sub.textContent = (item.kind === "video" ? "视频 · " : "图片 · ") +
+        (item.distance === null || item.distance === undefined ? "场景组" : "距离 " + item.distance) +
         " · " + fmtSize(item.size);
       info.appendChild(sub);
       box.onclick = function () {
@@ -1013,24 +1165,29 @@
     var hint = document.getElementById("mh-dupe-hint");
     if (!data.groups || !data.groups.length) {
       if (hint) hint.style.display = "";
-      dupeSetStatus((data.scene_mode ? "Stash 场景 pHash" : "已哈希 " + data.hashed + " 张") +
-        "；阈值 " + data.threshold + " 下没有重复组");
+      dupeSetStatus((data.scene_mode ? "Stash 场景 pHash" : "已哈希 " + data.hashed + " 个文件") +
+        "；严格阈值 " + data.threshold + " 下没有重复组" + (data.root ? " · " + data.root : ""));
       return;
     }
     if (hint) hint.style.display = "none";
     data.groups.forEach(function (g) {
       var card = document.createElement("div");
       card.className = "mh-dupe-group";
-      card.appendChild(dupeMakeImage(g.representative, "代表图 · " + g.count + " 个文件", true));
+      card.appendChild(dupeMakeImage(g.representative,
+        (g.representative.kind === "video" ? "代表视频" : "代表图") + " · " + g.count + " 个文件", true));
       var members = document.createElement("div");
       members.className = "mh-dupe-members";
       g.members.forEach(function (m) { members.appendChild(dupeMakeImage(m, m.name || "", false)); });
       card.appendChild(members);
       host.appendChild(card);
     });
-    var prefix = data.scene_mode ? "Stash 场景 pHash" : "已哈希 " + data.hashed + " 张";
+    var prefix = data.scene_mode ? "Stash 场景 pHash" :
+      "已哈希 " + data.hashed + " 个文件" +
+      (data.images !== undefined || data.videos !== undefined
+        ? "（图片 " + (data.images || 0) + " / 视频 " + (data.videos || 0) + "）" : "");
     dupeSetStatus(prefix + " · 找到 " + data.total_groups + " 组 / " +
-      data.total_files + " 个文件 · 阈值 " + data.threshold +
+      data.total_files + " 个文件 · 严格阈值 " + data.threshold +
+      (data.root ? " · " + data.root : "") +
       (data.returned < data.total_groups ? "（显示前 " + data.returned + " 组）" : ""));
   }
 
@@ -1110,10 +1267,21 @@
   function dupeScan() {
     var v = dupeValues();
     if (v.scope === "scene") return;
+    if (v.scope === "folder" && !v.root) {
+      dupeSetStatus("请输入要扫描的文件夹路径");
+      return;
+    }
     dupeStopPoll();
     var btn = document.getElementById("mh-dupe-scan");
     if (btn) btn.disabled = true;
-    pmFetch("/dupes/scan", { scope: v.scope, limit: 0, force: false }).then(function (j) {
+    var host = document.getElementById("mh-dupe-results");
+    if (host) host.textContent = "";
+    var payload = { scope: v.scope, limit: 0, force: false };
+    if (v.scope === "folder") {
+      payload.root = v.root;
+      payload.recursive = v.recursive;
+    }
+    pmFetch("/dupes/scan", payload).then(function (j) {
       dupeSetStatus("扫描任务已开始…");
       dupePoll(v.scope);
     }).catch(function (e) {
@@ -1130,7 +1298,7 @@
     DUPE.initialized = true;
     var v = dupeValues();
     dupeUpdateScopeControls();
-    if (v.scope === "scene") { dupeQuery(); return; }
+    if (v.scope === "scene" || v.scope === "folder") { dupeQuery(); return; }
     pmFetch("/dupes/status?scope=" + encodeURIComponent(v.scope), undefined).then(function (s) {
       var j = s.job || {};
       if (j.status === "running") {
@@ -1204,10 +1372,24 @@
       "#mh-hub .mh-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;align-content:start}",
       "#mh-hub .mh-card{background:#2c3e50;border:1px solid #3b4a55;border-radius:4px;overflow:hidden;min-height:0;position:relative}",
       "#mh-hub .mh-card.sel{border-color:#48aff0;box-shadow:0 0 0 2px #48aff0 inset}",
-      "#mh-hub .mh-card-check{position:absolute;right:8px;top:8px;z-index:3;width:16px;height:16px;cursor:pointer}",
+      "#mh-hub .mh-card-main{display:block;color:inherit;text-decoration:none}",
+      "#mh-hub .mh-card-check-wrap{position:absolute;right:8px;top:8px;z-index:4;width:22px;height:22px;display:flex;align-items:center;justify-content:center;background:rgba(13,17,23,.72);border:2px solid #dbe4eb;border-radius:4px;cursor:pointer}",
+      "#mh-hub .mh-card.sel .mh-card-check-wrap{background:#48aff0;border-color:#48aff0}",
+      "#mh-hub .mh-card-check{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:2}",
+      "#mh-hub .mh-card .mh-card-check-tick{display:none;padding:0;color:#15212b;font-size:16px;font-weight:700;line-height:1;pointer-events:none}",
+      "#mh-hub .mh-card .mh-card-check:checked + .mh-card-check-tick{display:block}",
       "#mh-hub .mh-card:hover{border-color:#48aff0}",
       "#mh-hub .mh-card img{display:block;width:100%;height:170px;object-fit:cover;background:#1f2a33}",
       "#mh-hub .mh-card span{display:block;padding:7px 9px;color:#c4d0da;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#mh-hub .mh-card-preview{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:3;width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(13,17,23,.8);border:1px solid rgba(255,255,255,.72);color:#fff;opacity:0;pointer-events:none;transition:opacity .12s}",
+      "#mh-hub .mh-card:hover .mh-card-preview,#mh-hub .mh-card:focus-within .mh-card-preview{opacity:1;pointer-events:auto}",
+      "#mh-hub .mh-card-preview:hover{background:#48aff0;color:#15212b}",
+      "@media (hover:none){#mh-hub .mh-card-preview{opacity:1;pointer-events:auto}}",
+      "#mh-hub #mh-regex-presets{display:none;flex-wrap:wrap;align-items:center;gap:6px;max-width:900px;margin-bottom:10px}",
+      "#mh-hub #mh-regex-presets.open{display:flex}",
+      "#mh-hub #mh-score-row{display:flex;flex-wrap:wrap;align-items:center;max-width:900px;margin-bottom:10px}",
+      "#mh-hub #mh-score-row.mh-hidden{display:none}",
+      "#mh-hub .mh-kind-label,#mh-hub .mh-mode-label{white-space:nowrap}",
       "#mh-hub .card{background:#2c3e50;border-color:#3b4a55}",
       "#mh-hub .form-control{background:#1f2a33;border-color:#4a5b69;color:#f5f8fa}",
       "#mh-hub .form-control:focus{background:#1f2a33;color:#fff;border-color:#48aff0;box-shadow:0 0 0 .15rem rgba(72,175,240,.25)}",
@@ -1291,10 +1473,43 @@
             <input id="mh-q" class="form-control" placeholder="中文/英文描述搜图，或输入图片/场景 ID">
             <div class="input-group-append"><button id="mh-go" class="btn btn-primary">搜索</button></div>
           </div>
-          <div class="d-flex flex-wrap align-items-center mb-2" style="max-width:900px">
+          <div class="d-flex flex-wrap align-items-center mb-2" style="max-width:900px;gap:6px">
+            <label for="mh-mode" class="small text-muted mb-0 mr-1 mh-mode-label">模式</label>
+            <select id="mh-mode" class="form-control form-control-sm mr-2" style="width:122px">
+              <option value="semantic">语义搜索</option>
+              <option value="regex">正则 / 关键词</option>
+            </select>
+            <label for="mh-kind" class="small text-muted mb-0 mr-1 mh-kind-label">范围</label>
+            <select id="mh-kind" class="form-control form-control-sm mr-2" style="width:92px">
+              <option value="all">全部</option>
+              <option value="image">图片</option>
+              <option value="scene">场景</option>
+            </select>
+            <label for="mh-match" class="small text-muted mb-0 mr-1">多关键词</label>
+            <select id="mh-match" class="form-control form-control-sm mr-2" style="width:92px">
+              <option value="all">全部命中</option>
+              <option value="any">任一命中</option>
+            </select>
+            <label id="mh-ignore-wrap" class="small text-muted mb-0 mr-2" style="display:none">
+              <input id="mh-ignore-case" type="checkbox" checked> 不区分大小写
+            </label>
+            <span id="mh-sep-hint" class="small text-muted">分隔：； ; ， , 、 | 换行</span>
+          </div>
+          <div id="mh-score-row">
             <label for="mh-min-score" class="small text-muted mb-0 mr-2">相似度 ≥ <span id="mh-min-score-val">0.055</span></label>
             <input id="mh-min-score" type="range" min="0" max="0.5" step="0.005" value="0.055" class="custom-range flex-grow-1" style="min-width:220px">
             <span id="mh-score-presets" class="ml-2"></span>
+          </div>
+          <div id="mh-regex-presets">
+            <span class="small text-muted mr-2">正则模板</span>
+            <button type="button" class="mh-preset" data-regex="\.gif$">GIF</button>
+            <button type="button" class="mh-preset" data-regex="\.(jpe?g|png|webp)$">静态图</button>
+            <button type="button" class="mh-preset" data-regex="\.(mp4|webm|mov|mkv)$">视频</button>
+            <button type="button" class="mh-preset" data-regex="\.null$">.null</button>
+            <button type="button" class="mh-preset" data-regex="^[0-9a-f]{32}\.(jpg|png|gif)$">QQ 哈希名</button>
+            <button type="button" class="mh-preset" data-regex="电脑|显示器|屏幕|笔记本">电脑相关</button>
+            <button type="button" class="mh-preset" data-regex="动漫|二次元|anime">二次元</button>
+            <button type="button" class="mh-preset" data-regex="qq|腾讯">QQ 标签</button>
           </div>
           <div class="d-flex flex-wrap align-items-center mb-2" style="max-width:900px">
             <label for="mh-top" class="small text-muted mb-0 mr-2">结果数</label>
@@ -1312,8 +1527,8 @@
           </div>
           <div id="mh-search-hint" class="mh-empty-state">
             <strong>搜索 MineHub 图库</strong>
-            输入中文或英文描述查找已入库的图片与场景；也可以打开任意图片或场景，在工具栏点击「找相似」。
-            <p class="small text-muted mb-0 mt-2">搜索使用 SigLIP2 语义向量，不要求图片标签包含关键词；结果不一定带有「电脑」等查询词标签。</p>
+            语义模式按画面含义查找；正则模式按文件名、路径、标签和 ID 匹配。多个关键词用 <code>；</code> <code>;</code> <code>，</code> <code>,</code> <code>、</code> 或换行分隔。
+            <p class="small text-muted mb-0 mt-2">图片或场景卡片上的放大镜会用 Stash 原生页面预览；勾选后可批量放入回收站或永久删除。</p>
           </div>
           <div id="mh-results" class="mh-card-grid"></div>
         </div>
@@ -1375,21 +1590,23 @@
           <div class="card mb-2"><div class="card-body py-2">
             <div class="form-row align-items-center">
               <div class="col-auto mb-1"><select id="mh-dupe-mode" class="form-control form-control-sm"><option value="similar">相似图片</option><option value="exact">完全相同文件</option></select></div>
-              <div class="col-auto mb-1" id="mh-dupe-scope-wrap"><select id="mh-dupe-scope" class="form-control form-control-sm"><option value="library">MineHub 库</option><option value="qq">QQ 图片缓存</option><option value="scene">Stash 场景（视频 pHash）</option></select></div>
-              <div class="col-auto mb-1" id="mh-dupe-algo-wrap"><select id="mh-dupe-algo" class="form-control form-control-sm"><option value="ahash">aHash 均值</option><option value="dhash">dHash 梯度</option><option value="phash">pHash DCT</option></select></div>
+              <div class="col-auto mb-1" id="mh-dupe-scope-wrap"><select id="mh-dupe-scope" class="form-control form-control-sm"><option value="library">MineHub 库</option><option value="qq">QQ 图片缓存</option><option value="folder">指定文件夹（图片+视频）</option><option value="scene">Stash 场景（视频 pHash）</option></select></div>
+              <div class="col-auto mb-1" id="mh-dupe-folder-wrap" style="display:none"><input id="mh-dupe-root" class="form-control form-control-sm" placeholder="文件夹路径，例如 D:\\Tencent Files\\...\\Thumb" style="width:360px"></div>
+              <div class="col-auto mb-1" id="mh-dupe-recursive-wrap" style="display:none"><div class="form-check form-check-inline"><input id="mh-dupe-recursive" type="checkbox" class="form-check-input" checked><label class="form-check-label" for="mh-dupe-recursive">含子文件夹</label></div></div>
+              <div class="col-auto mb-1" id="mh-dupe-algo-wrap"><select id="mh-dupe-algo" class="form-control form-control-sm"><option value="phash">pHash DCT（推荐）</option><option value="dhash">dHash 梯度</option><option value="ahash">aHash 均值</option></select></div>
               <div class="col-auto mb-1" id="mh-dupe-scan-wrap"><button id="mh-dupe-scan" class="btn btn-primary btn-sm">扫描并计算</button></div>
               <div class="col-auto mb-1"><button id="mh-dupe-query" class="btn btn-secondary btn-sm">重新分组</button></div>
             </div>
             <div id="mh-dupe-similar-opts" class="d-flex align-items-center mt-2" style="max-width:760px">
-              <label for="mh-dupe-threshold" class="small text-muted mb-0 mr-2">距离阈值 <span id="mh-dupe-threshold-val">10</span></label>
+              <label for="mh-dupe-threshold" class="small text-muted mb-0 mr-2">严格距离阈值 <span id="mh-dupe-threshold-val">10</span></label>
               <input id="mh-dupe-threshold" type="range" min="0" max="40" step="1" value="10" class="custom-range flex-grow-1">
               <span class="small text-muted ml-2">严格 0 · 宽松 40</span>
             </div>
             <div id="mh-dupe-status" class="small text-muted mt-2">选择范围后点击「扫描并计算」；调阈值只重新分组，不重算哈希。</div>
           </div></div>
           <div id="mh-dupe-hint" class="mh-empty-state">
-            <strong>相似图片与重复文件</strong>
-            相似图片使用 256 位感知哈希和汉明距离：0 是哈希完全一致，数值越大越宽松。完全相同文件直接读取 MineHub 账本里已有的 MD5，不重新扫描磁盘。
+            <strong>相似图片、视频与重复文件</strong>
+            「指定文件夹」会递归扫描图片和视频；图片使用 256 位感知哈希，视频抽取 5 帧 pHash 并按最差帧距离比较。分组采用严格全连接：组内任意两张都必须低于阈值，避免只靠一张“代表图”把不相关内容串进来。阈值越小越严格；0 只接受哈希完全一致。完全相同文件直接读取 MineHub 账本里已有的 MD5。
           </div>
           <div id="mh-dupe-results"></div>
         </div>
@@ -1449,6 +1666,21 @@
     });
     document.getElementById("mh-go").onclick = searchText;
     document.getElementById("mh-q").onkeydown = function (e) { if (e.key === "Enter") searchText(); };
+    document.getElementById("mh-mode").addEventListener("change", function () {
+      updateModeUI();
+      rerunWithOptions();
+    });
+    ["mh-kind", "mh-match", "mh-ignore-case"].forEach(function (id) {
+      document.getElementById(id).addEventListener("change", rerunWithOptions);
+    });
+    var regexButtons = document.querySelectorAll("#mh-regex-presets [data-regex]");
+    for (var ri = 0; ri < regexButtons.length; ri++) {
+      regexButtons[ri].onclick = function () {
+        var input = document.getElementById("mh-q");
+        if (input) input.value = this.dataset.regex;
+        searchText();
+      };
+    }
     document.getElementById("mh-min-score").addEventListener("input", function () {
       updateScoreLabel();
       renderScorePresets();
@@ -1466,9 +1698,13 @@
     document.getElementById("mh-search-clear").onclick = clearSearchSelection;
     renderScorePresets();
     renderTopPresets();
+    updateModeUI();
     updateSearchActions();
     document.getElementById("mh-dupe-mode").addEventListener("change", dupeToggleMode);
     document.getElementById("mh-dupe-scan").onclick = dupeScan;
+    document.getElementById("mh-dupe-root").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") dupeScan();
+    });
     document.getElementById("mh-dupe-query").onclick = dupeQuery;
     ["mh-dupe-scope", "mh-dupe-algo"].forEach(function (id) {
       document.getElementById(id).addEventListener("change", function () {
@@ -1514,10 +1750,14 @@
 
   function pageQuery() {
     var p = new URLSearchParams(location.search);
+    var id = p.get("stash_id") || "";
+    var kind = p.get("kind") || (id ? "image" : "all");
     return {
-      id: p.get("stash_id") || "",
-      kind: p.get("kind") || "image",
+      id: id,
+      kind: kind === "image" || kind === "scene" ? kind : "all",
       text: p.get("q") || p.get("text") || "",
+      mode: p.get("mode") === "regex" ? "regex" : "semantic",
+      match: p.get("match") === "any" ? "any" : "all",
       tab: p.get("tab") || "search"
     };
   }
@@ -1532,6 +1772,13 @@
     var title = document.getElementById("mh-title");
     var hint = document.getElementById("mh-search-hint");
     var input = document.getElementById("mh-q");
+    var modeEl = document.getElementById("mh-mode");
+    var kindEl = document.getElementById("mh-kind");
+    var matchEl = document.getElementById("mh-match");
+    if (modeEl) modeEl.value = p.id ? "semantic" : p.mode;
+    if (kindEl) kindEl.value = p.kind;
+    if (matchEl) matchEl.value = p.match;
+    updateModeUI();
     if (p.id) {
       setScoreRange("image");
       if (title) title.textContent = "相似于 " + (p.kind === "scene" ? "场景" : "图片") + " #" + p.id;
@@ -1539,10 +1786,9 @@
       doSearch({ stash_id: String(p.id), kind: p.kind, top: topValue(), min_score: scoreValue() });
     } else if (p.text) {
       if (input) input.value = p.text;
-      setScoreRange("text");
-      if (title) title.textContent = "MineHub 搜索";
+      if (title) title.textContent = p.mode === "regex" ? "MineHub 正则搜索" : "MineHub 搜索";
       if (hint) hint.style.display = "none";
-      doSearch({ text: p.text, top: topValue(), min_score: scoreValue() });
+      searchText();
     } else {
       setScoreRange("text");
       if (title) title.textContent = "";
@@ -1695,6 +1941,33 @@
       .catch(function () {});
   }
 
+  function installNativeSearchBridge() {
+    var path = location.pathname.replace(/\/+$/, "");
+    if (path !== "/images" && path !== "/scenes") return;
+    var inputs = document.querySelectorAll(".search-term-input input, .sidebar-search-container input");
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (!input.dataset.mhSemanticBound) {
+        input.dataset.mhSemanticBound = "1";
+        input.addEventListener("keydown", function (e) {
+          if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+          var text = e.currentTarget.value.trim();
+          if (!text) return;
+          var current = location.pathname.replace(/\/+$/, "");
+          var targetKind = current === "/images" ? "image" : (current === "/scenes" ? "scene" : "");
+          if (!targetKind) return;
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          var qs = new URLSearchParams({ q: text, kind: targetKind });
+          location.assign(PAGE_PATH + "?" + qs.toString());
+        }, true);
+      }
+      input.placeholder = "搜索…（回车用 MineHub 语义搜索）";
+      input.title = "回车使用 MineHub 语义搜索；多个关键词用；或,分隔";
+    }
+  }
+
   function translateExact() {
     var map = {"File(s) Size": "文件大小", "Production Date": "制作日期"};
     var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -1718,6 +1991,7 @@
     injectNavItem();
     injectDetailButton();
     injectGifNote();
+    installNativeSearchBridge();
     syncPage();
     ["mh-search-btn", "mh-pm-btn", "mh-sim-btn"].forEach(function (id) {
       var e = document.getElementById(id);

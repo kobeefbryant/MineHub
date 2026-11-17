@@ -99,6 +99,17 @@ class Manager:
         self.load_indexes()
 
     # ---------- configuration ----------
+    def allow_root(self, root: str) -> str:
+        path = Path(root).expanduser().resolve()
+        if not path.is_dir():
+            raise ValueError(f"文件夹不存在：{path}")
+        if path.parent == path:
+            raise ValueError("请不要扫描磁盘根目录")
+        with self.lock:
+            if _norm(str(path)) not in {_norm(item) for item in self.allowed_roots}:
+                self.allowed_roots.append(str(path))
+        return str(path)
+
     def roots(self) -> list[dict]:
         out: list[dict] = []
         for nt_data in QQ_ACCOUNTS:

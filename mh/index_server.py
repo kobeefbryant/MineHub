@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -49,10 +50,11 @@ let busy=false;
 async function status(){try{const r=await fetch('/status');const s=await r.json();$('#status').textContent=`${s.count} 个索引 · ${s.dim} 维 · ${s.device||''} · ${s.model||''}`}catch(e){$('#status').textContent='索引未就绪'}}
 status();
 function setBusy(v){busy=v;$('#go').disabled=v;if(v)msg.textContent='搜索中…'}
+const media=s=>s&&s.charAt(0)==='/'?'http://127.0.0.1:9998'+s:s;
 function render(items){grid.innerHTML='';if(!items.length){msg.textContent='没有结果';return}for(const it of items){
  const d=document.createElement('div');d.className='card';
- const a=document.createElement('a');a.href=it.page_url;a.target='_blank';a.rel='noreferrer';
- const im=document.createElement('img');im.loading='lazy';im.src=it.thumbnail_url;a.appendChild(im);d.appendChild(a);
+ const a=document.createElement('a');a.href=media(it.page_url);a.target='_blank';a.rel='noreferrer';
+ const im=document.createElement('img');im.loading='lazy';im.src=media(it.thumbnail_url);a.appendChild(im);d.appendChild(a);
  const m=document.createElement('div');m.className='meta';
  const score=document.createElement('div');score.className='score';score.textContent=`${(it.score*100).toFixed(1)}%`;
  const ident=document.createElement('div');ident.className='id';ident.textContent=`${it.kind} #${it.stash_id}`;
@@ -71,6 +73,62 @@ document.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)sendFi
 const params=new URLSearchParams(location.search), qid=params.get('id')||'', qkind=params.get('kind')||'auto';
 if(qid){$('#sid').value=qid;$('#kind').value=(qkind==='image'||qkind==='scene')?qkind:'auto';post({stash_id:qid,kind:$('#kind').value,top:parseInt($('#top').value)||20})}
 </script></body></html>"""
+
+
+SEMANTIC_SEPARATORS = re.compile(r"[;；,，、|\n]+")
+
+
+def split_terms(text: str, regex_mode: bool = False) -> list[str]:
+    if not regex_mode:
+        return [part.strip() for part in SEMANTIC_SEPARATORS.split(text) if part.strip()]
+    parts: list[str] = []
+    buf: list[str] = []
+    escaped = False
+    in_class = False
+    brace = 0
+    paren = 0
+    for ch in text:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]" and in_class:
+            in_class = False
+        elif not in_class:
+            if ch == "{":
+                brace += 1
+            elif ch == "}" and brace:
+                brace -= 1
+            elif ch == "(":
+                paren += 1
+            elif ch == ")" and paren:
+                paren -= 1
+        if not in_class and brace == 0 and paren == 0 and ch in ";；,，、\n":
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+        else:
+            buf.append(ch)
+    part = "".join(buf).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
+def payload_kinds(payload: dict) -> list[str] | None:
+    raw = str(payload.get("kind") or "all").strip().lower()
+    if raw in ("", "all", "auto"):
+        return None
+    if raw not in ("image", "scene"):
+        raise ValueError("kind 必须是 image、scene 或 all")
+    return [raw]
 
 
 class App:
@@ -92,13 +150,47 @@ class App:
         min_score = None
         if raw_min is not None and str(raw_min).strip() != "":
             min_score = max(-1.0, min(1.0, float(raw_min)))
+        mode = str(payload.get("mode") or "semantic").strip().lower()
+        match = str(payload.get("match") or "all").strip().lower()
+        kinds = payload_kinds(payload)
         text = str(payload.get("text") or "").strip()
+        if mode == "regex":
+            raw_patterns = payload.get("patterns")
+            if isinstance(raw_patterns, list):
+                patterns = [str(item).strip() for item in raw_patterns if str(item).strip()]
+            else:
+                patterns = split_terms(text, regex_mode=True)
+            if not patterns:
+                raise ValueError("请输入正则表达式")
+            if len(patterns) > 20:
+                raise ValueError("正则关键词最多 20 个")
+            flags = re.IGNORECASE if payload.get("ignore_case", True) else 0
+            compiled = []
+            for pattern in patterns:
+                if len(pattern) > 300:
+                    raise ValueError("单个正则不能超过 300 字符")
+                try:
+                    compiled.append(re.compile(pattern, flags))
+                except re.error as exc:
+                    raise ValueError(f"正则无效：{pattern}（{exc}）") from exc
+            with self.lock:
+                return self.index.search_regex(compiled, topk=top, kinds=kinds,
+                                                match_all=match != "any")
         if text:
             if self.index.model != "siglip2":
                 raise ValueError("文本搜图需要 siglip2 索引")
+            terms = split_terms(text)
+            if not terms:
+                raise ValueError("请输入搜索描述")
+            if len(terms) > 20:
+                raise ValueError("关键词最多 20 个")
             with self.lock:
-                q = self.embedder.text_embedding(text)
-                return self.index.search_vector(q, topk=top, min_score=min_score)
+                if len(terms) == 1:
+                    q = self.embedder.text_embedding(terms[0])
+                    return self.index.search_vector(q, topk=top, min_score=min_score, kinds=kinds)
+                queries = [self.embedder.text_embedding(term) for term in terms]
+                return self.index.search_vectors(queries, topk=top, min_score=min_score,
+                                                  kinds=kinds, aggregate=match)
         if payload.get("image_b64"):
             from PIL import Image
 
