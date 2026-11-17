@@ -11,6 +11,7 @@ from aiohttp import ClientSession, WSMsgType, web
 
 from .dupes import DuplicateStore
 from .index_server import App
+from .library_ops import delete_items
 from .stash import Stash
 
 HOP_HEADERS = {
@@ -80,6 +81,18 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
                 "width": width,
                 "height": height,
             })
+        except Exception as exc:  # noqa: BLE001
+            code, body = _error(exc)
+            return web.json_response(body, status=code)
+
+    async def library_delete(request: web.Request) -> web.Response:
+        try:
+            payload = await _json_body(request)
+            items = payload.get("items") or []
+            if not isinstance(items, list):
+                raise ValueError("items 必须是数组")
+            result = await asyncio.to_thread(delete_items, items, str(payload.get("mode") or ""))
+            return web.json_response(result)
         except Exception as exc:  # noqa: BLE001
             code, body = _error(exc)
             return web.json_response(body, status=code)
@@ -291,6 +304,7 @@ def make_app(public_port: int = 9999, internal_port: int = 9998) -> web.Applicat
     app.router.add_get("/mh/api/health", health)
     app.router.add_get("/mh/api/status", status)
     app.router.add_get("/mh/api/media/info", media_info)
+    app.router.add_post("/mh/api/library/delete", library_delete)
     app.router.add_post("/mh/api/search", search)
     app.router.add_post("/mh/api/reload", reload)
     app.router.add_post("/mh/api/reload-labels", reload_labels)

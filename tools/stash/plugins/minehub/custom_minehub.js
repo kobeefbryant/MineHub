@@ -12,6 +12,10 @@
   var PAGE_PATH = "/mh";
   var PAGE_QUERY = null;
   var GIF_INFO = null;
+  var SEARCH_ITEMS = Object.create(null);
+  var SEARCH_SELECTED = Object.create(null);
+  var SEARCH_DELETED = Object.create(null);
+  var SEARCH_BUSY = false;
   var PM = {
     cfg: null,
     chats: [],
@@ -271,6 +275,79 @@
     scoreTimer = setTimeout(function () { if (LAST_SEARCH) doSearch(LAST_SEARCH); }, 250);
   }
 
+  function updateSearchActions() {
+    var n = Object.keys(SEARCH_SELECTED).length;
+    var box = document.getElementById("mh-search-actions");
+    var count = document.getElementById("mh-search-selected-count");
+    if (box) box.style.display = n ? "flex" : "none";
+    if (count) count.textContent = "已选 " + n + " 个";
+    ["mh-search-trash", "mh-search-delete", "mh-search-clear"].forEach(function (id) {
+      var e = document.getElementById(id);
+      if (e) e.disabled = SEARCH_BUSY || !n;
+    });
+  }
+
+  function toggleSearchSelection(key, checked, card) {
+    if (checked) SEARCH_SELECTED[key] = SEARCH_ITEMS[key];
+    else delete SEARCH_SELECTED[key];
+    if (card) card.classList.toggle("sel", checked);
+    updateSearchActions();
+  }
+
+  function clearSearchSelection() {
+    SEARCH_SELECTED = Object.create(null);
+    var checks = document.querySelectorAll("#mh-results .mh-card-check");
+    for (var i = 0; i < checks.length; i++) checks[i].checked = false;
+    var cards = document.querySelectorAll("#mh-results .mh-card.sel");
+    for (var j = 0; j < cards.length; j++) cards[j].classList.remove("sel");
+    updateSearchActions();
+  }
+
+  function searchDelete(mode) {
+    if (SEARCH_BUSY) return;
+    var keys = Object.keys(SEARCH_SELECTED);
+    if (!keys.length) return;
+    var items = keys.map(function (k) { return SEARCH_SELECTED[k]; });
+    var message = mode === "trash"
+      ? "确定将 " + items.length + " 个结果放入电脑回收站？\n会同时移除 Stash 记录和生成的预览文件，原文件可在回收站恢复。"
+      : "确定永久删除 " + items.length + " 个结果的原文件？\n此操作不可恢复，Stash 记录和生成的预览文件也会移除。";
+    if (!window.confirm(message)) return;
+    SEARCH_BUSY = true;
+    updateSearchActions();
+    setStatus(mode === "trash" ? "正在放入回收站…" : "正在永久删除…");
+    fetch(BASE + "/library/delete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: mode, items: items.map(function (x) {
+        return { kind: x.kind, id: x.stash_id };
+      }) })
+    }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        return j;
+      });
+    }).then(function (j) {
+      var ok = (j.items || []).filter(function (x) { return x.ok; });
+      ok.forEach(function (x) {
+        var key = x.kind + "|" + x.id;
+        SEARCH_DELETED[key] = true;
+        delete SEARCH_SELECTED[key];
+        var cards = document.querySelectorAll("#mh-results .mh-card");
+        for (var i = 0; i < cards.length; i++) {
+          if (cards[i].dataset.mhKey === key) cards[i].remove();
+        }
+      });
+      setStatus((mode === "trash" ? "已放入回收站 " : "已删除 ") + ok.length + " 个" +
+        (j.failed ? "；失败 " + j.failed + " 个" : ""));
+      updateSearchActions();
+    }).catch(function (e) {
+      setStatus("删除失败：" + (e.message || e));
+    }).finally(function () {
+      SEARCH_BUSY = false;
+      updateSearchActions();
+    });
+  }
+
   function searchText() {
     var input = document.getElementById("mh-q");
     var text = input ? input.value.trim() : "";
@@ -286,6 +363,9 @@
     LAST_SEARCH = payload;
     if (busy) { QUEUED_SEARCH = payload; return; }
     busy = true;
+    SEARCH_ITEMS = Object.create(null);
+    SEARCH_SELECTED = Object.create(null);
+    updateSearchActions();
     setStatus("搜索中…");
     var results = document.getElementById("mh-results");
     results.textContent = "";
@@ -302,15 +382,29 @@
         return j;
       });
     }).then(function (j) {
-      var rows = j.results || [];
+      var rows = (j.results || []).filter(function (x) {
+        return !SEARCH_DELETED[x.kind + "|" + x.stash_id];
+      });
       var cutoff = Number(payload.min_score);
       var cutoffText = Number.isFinite(cutoff) ? " · 相似度 ≥ " + cutoff.toFixed(3) : "";
       setStatus(rows.length ? ("共 " + rows.length + " 个结果" + cutoffText) : ("没有找到结果" + cutoffText));
       rows.forEach(function (x) {
+        var key = x.kind + "|" + x.stash_id;
+        SEARCH_ITEMS[key] = x;
         var a = document.createElement("a");
         a.className = "mh-card";
         a.href = x.page_url;
+        a.dataset.mhKey = key;
         a.title = (x.kind === "scene" ? "场景" : "图片") + " #" + x.stash_id;
+        var chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.className = "mh-card-check";
+        chk.title = "选择此结果";
+        chk.onclick = function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          toggleSearchSelection(key, chk.checked, a);
+        };
         var img = document.createElement("img");
         img.loading = "lazy";
         img.src = x.thumbnail_url;
@@ -321,6 +415,7 @@
           (Number.isFinite(score) ? " · " + score.toFixed(3) : "");
         a.appendChild(img);
         a.appendChild(cap);
+        a.appendChild(chk);
         results.appendChild(a);
       });
     }).catch(function (e) {
@@ -1107,7 +1202,9 @@
       "#mh-hub .nav-tabs .nav-link:hover{color:#fff;border-bottom-color:#5f6b76}",
       "#mh-hub .nav-tabs .nav-link.active{color:#48aff0;background:transparent;border-bottom-color:#48aff0}",
       "#mh-hub .mh-card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;align-content:start}",
-      "#mh-hub .mh-card{background:#2c3e50;border:1px solid #3b4a55;border-radius:4px;overflow:hidden;min-height:0}",
+      "#mh-hub .mh-card{background:#2c3e50;border:1px solid #3b4a55;border-radius:4px;overflow:hidden;min-height:0;position:relative}",
+      "#mh-hub .mh-card.sel{border-color:#48aff0;box-shadow:0 0 0 2px #48aff0 inset}",
+      "#mh-hub .mh-card-check{position:absolute;right:8px;top:8px;z-index:3;width:16px;height:16px;cursor:pointer}",
       "#mh-hub .mh-card:hover{border-color:#48aff0}",
       "#mh-hub .mh-card img{display:block;width:100%;height:170px;object-fit:cover;background:#1f2a33}",
       "#mh-hub .mh-card span{display:block;padding:7px 9px;color:#c4d0da;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
@@ -1207,6 +1304,12 @@
           </div>
           <div class="mb-2"><span id="mh-title" class="text-muted"></span></div>
           <div id="mh-status" class="text-muted mb-3"></div>
+          <div id="mh-search-actions" class="flex-wrap align-items-center mb-3" style="display:none">
+            <span id="mh-search-selected-count" class="text-muted mr-3">已选 0 个</span>
+            <button id="mh-search-trash" type="button" class="btn btn-secondary btn-sm mr-2">放入回收站</button>
+            <button id="mh-search-delete" type="button" class="btn btn-danger btn-sm mr-2">直接删除文件</button>
+            <button id="mh-search-clear" type="button" class="btn btn-secondary btn-sm">取消选择</button>
+          </div>
           <div id="mh-search-hint" class="mh-empty-state">
             <strong>搜索 MineHub 图库</strong>
             输入中文或英文描述查找已入库的图片与场景；也可以打开任意图片或场景，在工具栏点击「找相似」。
@@ -1358,8 +1461,12 @@
     document.getElementById("mh-top").addEventListener("change", function () {
       setTopValue(topValue());
     });
+    document.getElementById("mh-search-trash").onclick = function () { searchDelete("trash"); };
+    document.getElementById("mh-search-delete").onclick = function () { searchDelete("delete"); };
+    document.getElementById("mh-search-clear").onclick = clearSearchSelection;
     renderScorePresets();
     renderTopPresets();
+    updateSearchActions();
     document.getElementById("mh-dupe-mode").addEventListener("change", dupeToggleMode);
     document.getElementById("mh-dupe-scan").onclick = dupeScan;
     document.getElementById("mh-dupe-query").onclick = dupeQuery;

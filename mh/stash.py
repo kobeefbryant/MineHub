@@ -67,13 +67,37 @@ class Stash:
             raise RuntimeError(f"stash graphql error: {data['errors'][:2]}")
         return data["data"]
 
-    def image_path(self, image_id: str) -> str | None:
+    def image_paths(self, image_id: str) -> list[str]:
         data = self.graphql(
             "query($id:ID!){ findImage(id:$id){ visual_files{ ... on ImageFile { path } ... on VideoFile { path } } } }",
             {"id": str(image_id)},
         )
         files = (data.get("findImage") or {}).get("visual_files") or []
-        return files[0].get("path") if files else None
+        return [str(f["path"]) for f in files if f.get("path")]
+
+    def image_path(self, image_id: str) -> str | None:
+        paths = self.image_paths(image_id)
+        return paths[0] if paths else None
+
+    def scene_paths(self, scene_id: str) -> list[str]:
+        data = self.graphql(
+            "query($id:ID!){ findScene(id:$id){ files{ path } } }",
+            {"id": str(scene_id)},
+        )
+        files = (data.get("findScene") or {}).get("files") or []
+        return [str(f["path"]) for f in files if f.get("path")]
+
+    def destroy_image(self, image_id: str, delete_file: bool) -> None:
+        self.graphql(
+            "mutation($id:ID!,$file:Boolean){ imageDestroy(input:{id:$id,delete_file:$file,delete_generated:true,destroy_file_entry:true}) }",
+            {"id": str(image_id), "file": bool(delete_file)},
+        )
+
+    def destroy_scene(self, scene_id: str, delete_file: bool) -> None:
+        self.graphql(
+            "mutation($id:ID!,$file:Boolean){ sceneDestroy(input:{id:$id,delete_file:$file,delete_generated:true,destroy_file_entry:true}) }",
+            {"id": str(scene_id), "file": bool(delete_file)},
+        )
 
     def wait_ready(self, timeout: float = 180) -> bool:
         deadline = time.time() + timeout
@@ -92,7 +116,7 @@ class Stash:
         (plugin_dir / "minehub.yml").write_text(
             """name: MineHub Native Search
 description: MineHub text search, QQ cache and similarity entry points served through the same-origin gateway.
-version: 1.0.2
+version: 1.0.3
 ui:
   javascript:
     - custom_minehub.js

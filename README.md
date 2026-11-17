@@ -148,12 +148,21 @@ set PYTHONPATH=.
 - 输入中文或英文描述做文本搜图（原版 `google/siglip2-base-patch16-256`，运行在 CUDA）；
 - 相似度滑杆带预设：文本 `0.030 / 0.055 / 0.080 / 0.120 / 0.180`，图片 `0.650 / 0.750 / 0.820 / 0.900 / 0.950`，也可以继续手动拖动；
 - 结果数默认 24，可点 `24 / 48 / 100` 预设，或手动输入 1–100；
+- 搜索结果可勾选多个条目，再选择「放入回收站」或「直接删除文件」；回收站使用系统回收站，直接删除会永久删除库中的原文件；
 - 图片/场景详情页点击「找相似」，会跳转到 `/mh?stash_id=<id>&kind=<image|scene>`，直接查同一索引的 Top-K；
 - 搜索结果点击后进入 MineHub 原生详情页。
 
 搜索使用 SigLIP2 图文语义向量，不是标签精确匹配：结果可能画面里有电脑，但标签列表没有「电脑」；同样，带「电脑」标签也不保证一定排在前面。
 
-底层 API 统一为同源 `/mh/api/search`、`/mh/api/status`、`/mh/api/reload`、`/mh/api/media/info`（返回图片帧数，用于单帧 GIF 标注）。索引数据：`data\vectors_siglip2.sqlite` + `data\embeddings_siglip2.npy`；旧 `nsfw-siglip2` 索引保留在 `data\vectors.sqlite` + `data\embeddings.npy`。只读 Stash 缩略图，不复制媒体文件。`mh.cli index serve --port 8765` 仅保留为脱离 Stash 的调试入口，日常不使用。
+底层 API 统一为同源 `/mh/api/search`、`/mh/api/status`、`/mh/api/reload`、`/mh/api/media/info`（返回图片帧数，用于单帧 GIF 标注）、`/mh/api/library/delete`（批量回收/永久删除库文件）。索引数据：`data\vectors_siglip2.sqlite` + `data\embeddings_siglip2.npy`；旧 `nsfw-siglip2` 索引保留在 `data\vectors.sqlite` + `data\embeddings.npy`。只读 Stash 缩略图，不复制媒体文件。`mh.cli index serve --port 8765` 仅保留为脱离 Stash 的调试入口，日常不使用。
+
+## 删除行为
+
+- Stash 自带删除框里的「删除文件」才会删除原始媒体文件；不勾选时只移除 Stash 记录。
+- 「删除已生成的附加文件」指 Stash 生成的缩略图、预览、sprite、phash 等缓存，不是原始媒体；取消勾选会保留这些生成文件。
+- MineHub 搜索结果的「放入回收站」：把原文件移入 Windows 回收站，同时移除 Stash 记录和生成预览，可从回收站恢复。
+- MineHub 搜索结果的「直接删除文件」：永久删除 `library`/`review` 中的原始文件，并移除 Stash 记录和生成预览；不可恢复。
+- 两个批量操作只接受 MineHub 库或 review 目录内的路径，拒绝目录外文件。
 
 ## 重复检测与阈值（对照 Krokiet/czkawka）
 
