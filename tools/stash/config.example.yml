@@ -1,0 +1,21 @@
+# Copy to tools/stash/config.yml and adjust the paths for your machine.
+# config.yml is intentionally ignored by Git because it contains Stash secrets.
+# Stash generates jwt_secret_key / session_store_key on first run when omitted.
+
+host: 127.0.0.1
+port: 9998
+nobrowser: true
+language: zh-CN
+javascriptenabled: true
+
+database: C:/path/to/MineHub/data/stash/stash-go.sqlite
+generated: C:/path/to/MineHubData/stash/generated
+blobs_path: C:/path/to/MineHubData/stash/blobs
+plugins_path: C:/path/to/MineHub/tools/stash/plugins
+scrapers_path: C:/path/to/MineHub/tools/stash/scrapers
+
+ffmpeg: ffmpeg
+ffprobe: ffprobe
+
+stash:
+  - path: C:/path/to/MineHubData/library

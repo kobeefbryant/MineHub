@@ -1,0 +1,6 @@
+name: MineHub Native Search
+description: MineHub text search, QQ cache and similarity entry points served through the same-origin gateway.
+version: 1.0.0
+ui:
+  javascript:
+    - custom_minehub.js
