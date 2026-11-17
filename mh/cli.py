@@ -49,6 +49,18 @@ def cmd_move(args: argparse.Namespace) -> None:
         print(move_all(args.limit, args.dry_run, not args.no_md5))
 
 
+def cmd_content_audit(args: argparse.Namespace) -> None:
+    from .direct_audit import run_audit, run_restore, stats
+
+    if args.stage == "audit":
+        print(run_audit(model=args.model, slots=args.slots, workers=args.workers,
+                        limit=args.limit, dry_run=args.dry_run))
+    elif args.stage == "restore":
+        print(run_restore(limit=args.limit, dry_run=args.dry_run))
+    else:
+        print(json.dumps(stats(), ensure_ascii=False, indent=1))
+
+
 def cmd_baseline(args: argparse.Namespace) -> None:
     from .hash_baseline import hash_kept
 
@@ -144,6 +156,35 @@ def cmd_index(args: argparse.Namespace) -> None:
         print(json.dumps(idx.status(), ensure_ascii=False, indent=1))
 
 
+def cmd_faces(args: argparse.Namespace) -> None:
+    from .faces import Faces
+
+    svc = Faces()
+    if args.stage == "status":
+        print(json.dumps(svc.status(args.min_images), ensure_ascii=False, indent=1))
+        return
+    if args.stage == "apply":
+        print(json.dumps(svc.apply(args.min_images, args.prefix, args.cluster_ids or []),
+                         ensure_ascii=False, indent=1))
+        return
+    if args.stage == "scan":
+        svc.start_scan(args.force, args.limit)
+    else:
+        svc.start_cluster(args.threshold, args.min_images)
+    last = None
+    while True:
+        state = svc.status(args.min_images)
+        task = state.get("task") or {}
+        marker = (task.get("stage"), task.get("done"), task.get("total"), task.get("message"))
+        if marker != last:
+            print(json.dumps(task, ensure_ascii=False), flush=True)
+            last = marker
+        if not task.get("running"):
+            print(json.dumps(state, ensure_ascii=False, indent=1))
+            return
+        time.sleep(2)
+
+
 def cmd_stash(args: argparse.Namespace) -> None:
     from .stash import Stash, start_stash
 
@@ -234,19 +275,38 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=0)
     p.set_defaults(func=cmd_reaudit)
 
+    p = sub.add_parser("content-audit", help="corporeal content audit and non-corporeal restore")
+    p.add_argument("stage", choices=["audit", "restore", "status"])
+    p.add_argument("--model", default="huihui", choices=["huihui", "nsfw"])
+    p.add_argument("--slots", type=int, default=4)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_content_audit)
+
     p = sub.add_parser("index")
     p.add_argument("stage", choices=["build", "search", "serve", "refresh", "status"])
     p.add_argument("--kind", choices=["images", "scenes", "all", "image", "scene"], default="all")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    p.add_argument("--model", choices=["nsfw", "siglip2"], default="nsfw")
+    p.add_argument("--model", choices=["nsfw", "siglip2", "qwen3vl"], default="nsfw")
     p.add_argument("--id", default="")
     p.add_argument("--file", default="")
     p.add_argument("--text", default="")
     p.add_argument("--top", type=int, default=20)
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser("faces", help="InsightFace scan, clustering and Stash performer assignment")
+    p.add_argument("stage", choices=["status", "scan", "cluster", "apply"])
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--min-images", type=int, default=3)
+    p.add_argument("--prefix", default="人物")
+    p.add_argument("--cluster-ids", type=int, nargs="*", default=[])
+    p.set_defaults(func=cmd_faces)
 
     p = sub.add_parser("stash")
     p.add_argument("--restart", action="store_true")

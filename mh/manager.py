@@ -413,6 +413,7 @@ class Manager:
         checked = set(payload.get("checked_chats") or [])
         include_unknown = bool(payload.get("include_unknown"))
         only_mapped = bool(payload.get("only_mapped"))
+        only_groups = bool(payload.get("only_groups"))
         cat = payload.get("mh_cat") or "all"
         level = payload.get("mh_level") or "all"
         tags = [str(t).strip().casefold() for t in (payload.get("mh_tags") or []) if str(t).strip()]
@@ -442,7 +443,9 @@ class Manager:
             if text and text not in (rec.name + " " + rec.rel_dir).casefold():
                 continue
             label = labels.get(_norm(rec.path)) if rec.path else None
-            refs = self._refs(rec, label, chat_map)
+            refs = self._refs(rec, label, chat_map, only_groups)
+            if only_groups and not refs:
+                continue
             if only_mapped and not refs:
                 continue
             if chat_mode == "include":
@@ -466,7 +469,7 @@ class Manager:
 
         key = {
             "name": lambda r: r.name.casefold(),
-            "chat": lambda r: (self._refs(r, labels.get(_norm(r.path)), chat_map) or [{}])[0].get("name", "").casefold(),
+            "chat": lambda r: (self._refs(r, labels.get(_norm(r.path)), chat_map, only_groups) or [{}])[0].get("name", "").casefold(),
             "mtime": lambda r: r.mtime,
             "path": lambda r: (r.rel_dir + "/" + r.name).casefold(),
             "size": lambda r: r.size,
@@ -475,7 +478,7 @@ class Manager:
         pages = max(1, (len(out) + page_size - 1) // page_size)
         page = min(page, pages)
         start = (page - 1) * page_size
-        rows = [self._row(r, labels, chat_map) for r in out[start:start + page_size]]
+        rows = [self._row(r, labels, chat_map, only_groups) for r in out[start:start + page_size]]
         return {
             "total": len(out), "total_size": total_size, "mapped": mapped, "labeled": labeled,
             "page": page, "pages": pages, "page_size": page_size, "records": rows,
@@ -503,19 +506,34 @@ class Manager:
         return True
 
     @staticmethod
-    def _refs(rec: FileRec, label: dict | None, chat_map: dict) -> list[dict]:
+    def _refs(rec: FileRec, label: dict | None, chat_map: dict,
+              only_groups: bool = False) -> list[dict]:
         seen: set[str] = set()
         out: list[dict] = []
         for md5 in (rec.md5, (label or {}).get("qq_md5") or ""):
             for ref in chat_map.get(md5, []) if md5 else []:
+                if only_groups and ref.get("kind") != "group":
+                    continue
                 if ref["key"] not in seen:
                     seen.add(ref["key"])
                     out.append(ref)
         return out
 
-    def _row(self, rec: FileRec, labels: dict, chat_map: dict) -> dict:
+    def group_paths(self, paths: list[str]) -> set[str]:
+        """Return paths whose QQ filename MD5 belongs to at least one group chat."""
+        with self.lock:
+            chat_map = self.chat_map
+        out: set[str] = set()
+        for raw in paths:
+            md5 = _parse_md5(Path(raw).name)
+            if md5 and any(ref.get("kind") == "group" for ref in chat_map.get(md5, [])):
+                out.add(_norm(raw))
+        return out
+
+    def _row(self, rec: FileRec, labels: dict, chat_map: dict,
+             only_groups: bool = False) -> dict:
         label = labels.get(_norm(rec.path))
-        refs = self._refs(rec, label, chat_map)
+        refs = self._refs(rec, label, chat_map, only_groups)
         return {
             "path": rec.path, "name": rec.name, "rel_dir": rec.rel_dir, "size": rec.size,
             "mtime": int(rec.mtime), "kind": rec.kind, "md5": rec.md5, "variant": rec.variant,
@@ -618,6 +636,71 @@ class Manager:
                 errors.append(f"{path}: {exc}")
         self._remove_from_cache([p for p, _ in moved])
         return {"moved": moved, "errors": errors}
+
+    def move_to_library(self, paths: list[str]) -> dict:
+        """Move selected QQ/review files into LIBRARY/<category>/<YYYY-MM>."""
+        from .db import Ledger
+        from .stage3 import target_name
+
+        with self.lock:
+            labels = dict(self.labels)
+        moved: list[list[str]] = []
+        errors: list[str] = []
+        scan_dirs: set[str] = set()
+        for path in paths:
+            try:
+                if not self._allowed(path):
+                    raise PermissionError("路径不在允许范围内")
+                label = labels.get(_norm(path)) or {}
+                category = str(label.get("category") or "review")
+                if category not in {"daily", "sexy", "adult", "anime", "sticker",
+                                    "screenshot", "review", "other"}:
+                    category = "review"
+                mtime = os.path.getmtime(path)
+                month = time.strftime("%Y-%m", time.localtime(mtime))
+                dest_dir = LIBRARY / category / month
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                target = self._unique(dest_dir / target_name(path), set())
+                shutil.move(path, target)
+                moved.append([path, str(target)])
+                scan_dirs.add(str(dest_dir))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{path}: {exc}")
+        if moved:
+            led = Ledger()
+            try:
+                now = time.time()
+                candidates = list(dict.fromkeys(
+                    value for src, dst in moved for value in (src, dst)
+                ))
+                by_src: dict[str, sqlite3.Row] = {}
+                by_target: dict[str, sqlite3.Row] = {}
+                for start in range(0, len(candidates), 300):
+                    chunk = candidates[start:start + 300]
+                    marks = ",".join("?" for _ in chunk)
+                    rows = led.conn.execute(
+                        f"SELECT id, src_path, target_path FROM files "
+                        f"WHERE target_path IN ({marks}) OR src_path IN ({marks}) ORDER BY id",
+                        chunk + chunk,
+                    ).fetchall()
+                    for row in rows:
+                        if row["src_path"]:
+                            by_src.setdefault(str(row["src_path"]), row)
+                        if row["target_path"]:
+                            by_target.setdefault(str(row["target_path"]), row)
+                for src, dst in moved:
+                    row = by_src.get(src) or by_target.get(src) or by_target.get(dst) or by_src.get(dst)
+                    if row:
+                        led.conn.execute(
+                            "UPDATE files SET target_path=?, move_state='moved', stash_state='pending', "
+                            "needs_review=1, updated_at=? WHERE id=?",
+                            (dst, now, row["id"]),
+                        )
+                led.commit()
+            finally:
+                led.close()
+            self._remove_from_cache([src for src, _dst in moved])
+        return {"moved": moved, "errors": errors, "scan_dirs": sorted(scan_dirs)}
 
     @staticmethod
     def _unique(target: Path, taken: set[str]) -> Path:

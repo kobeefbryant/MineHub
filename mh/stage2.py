@@ -21,8 +21,11 @@ WHERE stage2_json IS NULL
   AND is_thumb=0
   AND (kind='video'
        OR (kind='image' AND lower(src_path) LIKE '%.gif')
-       OR stage1_label IN
-          ('Normal','Enticing or Sensual','Pornography','Anime Picture','Hentai'))
+       OR stage1_label IN ('Enticing or Sensual','Pornography','Anime Picture','Hentai')
+       OR (stage1_label='Normal' AND max(
+             COALESCE(json_extract(stage1_scores,'$.Pornography'),0),
+             COALESCE(json_extract(stage1_scores,'$.Hentai'),0),
+             COALESCE(json_extract(stage1_scores,'$.Enticing or Sensual'),0)) >= 0.3))
 ORDER BY (kind='video') DESC,
          CASE stage1_label WHEN 'Pornography' THEN 0 WHEN 'Enticing or Sensual' THEN 1 ELSE 2 END,
          size DESC
@@ -134,6 +137,7 @@ def _merge(verdict_a: dict, verdict_b: dict | None, siglip_scores: dict | None, 
         "clothing": verdict_a.get("clothing", "unknown") if verdict_a.get("clothing") in CLOTHING_CATS else "unknown",
         "needs_review": bool(review),
         "source": source,
+        "corporeal_nsfw": bool(verdict_a.get("corporeal_nsfw")) or bool((verdict_b or {}).get("corporeal_nsfw")),
         "b_category": (verdict_b or {}).get("category"),
         "b_nsfw_level": (verdict_b or {}).get("nsfw_level"),
     }

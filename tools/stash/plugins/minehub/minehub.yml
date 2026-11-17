@@ -1,6 +1,6 @@
 name: MineHub Native Search
-description: MineHub media intelligence for Stash: semantic image/text search, duplicate detection, native preview, and optional QQ cache import.
-version: 1.0.5
+description: "MineHub media intelligence for Stash: semantic image/text search, face clustering into performers, duplicate detection, native preview, and optional QQ cache import."
+version: 1.0.26
 ui:
   javascript:
     - custom_minehub.js

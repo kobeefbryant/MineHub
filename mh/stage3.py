@@ -131,7 +131,21 @@ def reconcile_missing(led: Ledger | None = None) -> dict:
     return {"repaired": repaired, "checked": len(rows)}
 
 
-NSFW_SQL = "json_extract(final_json,'$.nsfw_level') IN ('suggestive','explicit')"
+# Library policy: keep corporeal sexual/suggestive content (including lingerie,
+# swimwear and covered/censored bodies); text cards, chat screenshots, memes and
+# stickers are excluded. Audited rows use corporeal_nsfw; legacy rows fall back
+# to explicit plus suggestive in person-centric categories.
+NSFW_SQL = """(
+    json_extract(final_json,'$.corporeal_nsfw')=1
+    OR (json_extract(final_json,'$.corporeal_nsfw') IS NULL
+        AND json_extract(final_json,'$.direct_exposure') IS NULL
+        AND category <> 'sticker'
+        AND (
+            json_extract(final_json,'$.nsfw_level')='explicit'
+            OR (category IN ('sexy','anime','adult')
+                AND json_extract(final_json,'$.nsfw_level')='suggestive')
+        ))
+)"""
 
 
 def recover_moving(led: Ledger | None = None) -> dict:

@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlparse
 
 from .index import SimilarityIndex
 from .manager import Manager
+from .semantic import GROUP_NAMES, LABELS, group_for_tags, project, top_labels
+from .stash import Stash
 
 PAGE = r"""<!doctype html>
 <html lang="zh-CN">
@@ -75,7 +77,7 @@ if(qid){$('#sid').value=qid;$('#kind').value=(qkind==='image'||qkind==='scene')?
 </script></body></html>"""
 
 
-SEMANTIC_SEPARATORS = re.compile(r"[;；,，、|\n]+")
+SEMANTIC_SEPARATORS = re.compile(r"[;；,，、|。．.\n\\]+")
 
 
 def split_terms(text: str, regex_mode: bool = False) -> list[str]:
@@ -131,21 +133,143 @@ def payload_kinds(payload: dict) -> list[str] | None:
     return [raw]
 
 
+SEARCH_FIELDS = ("title", "path", "basename", "tags", "id")
+
+
+def payload_fields(payload: dict) -> list[str] | None:
+    raw = payload.get("fields")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("fields 必须是数组")
+    fields: list[str] = []
+    for item in raw:
+        name = str(item).strip().lower()
+        if name in SEARCH_FIELDS and name not in fields:
+            fields.append(name)
+    if not fields:
+        raise ValueError("fields 必须包含 title、path、basename、tags 或 id")
+    return fields
+
+
 class App:
     def __init__(self, device: str = "cpu", model: str = "nsfw") -> None:
         self.index = SimilarityIndex(model=model)
         self.embedder = self.index.make_embedder(device)
         self.lock = threading.Lock()
         self.manager = Manager()
+        self._label_emb = None
+        self._map_cache = None
 
     def reload(self) -> dict:
         with self.lock:
             self.index._items = None
             self.index._emb = None
+            self._map_cache = None
             return self.index.status()
+
+    def _label_matrix(self):
+        if self._label_emb is None:
+            self._label_emb = self.embedder.text_embeddings([key for key, _ in LABELS])
+        return self._label_emb
+
+    @staticmethod
+    def _literal_hits(row: dict, terms: list[str], fields: list[str],
+                      patterns: list[re.Pattern] | None = None) -> list[str]:
+        source_path = str(row.get("source_path") or "")
+        values = {
+            "title": str(row.get("title") or ""),
+            "path": source_path,
+            "basename": source_path.replace("/", "\\").rsplit("\\", 1)[-1],
+            "tags": str(row.get("tags") or ""),
+            "id": str(row.get("stash_id") or ""),
+        }
+        haystacks = [values[name] for name in fields if values.get(name)]
+        if patterns:
+            return [
+                term for term, pattern in zip(terms, patterns)
+                if any(pattern.search(value) for value in haystacks)
+            ]
+        lowered = [value.lower() for value in haystacks]
+        return [term for term in terms if any(term.lower() in value for value in lowered)]
+
+    def features(self, kind: str, stash_id: str) -> dict:
+        kind = str(kind or "image").strip().lower()
+        if kind not in ("image", "scene"):
+            raise ValueError("kind 必须是 image 或 scene")
+        stash_id = str(stash_id or "").strip()
+        if not stash_id:
+            raise ValueError("缺少 Stash ID")
+        with self.lock:
+            found = self.index.find_vector(kind, stash_id)
+            if found is None:
+                raise LookupError(f"索引中没有 {kind} #{stash_id}")
+            item, vector = found
+            labels = top_labels(vector, self._label_matrix(), 5)
+        thumbnail_url = item.get("thumbnail_url") or ""
+        image_url = thumbnail_url
+        if kind == "image":
+            try:
+                data = Stash().graphql(
+                    "query($id:ID!){findImage(id:$id){paths{image thumbnail}}}",
+                    {"id": stash_id},
+                )
+                paths = (data.get("findImage") or {}).get("paths") or {}
+                image_url = str(paths.get("image") or paths.get("thumbnail") or image_url)
+            except Exception:
+                pass
+        tags = [tag.strip() for tag in str(item.get("tags") or "").split(",") if tag.strip()]
+        return {
+            "kind": kind,
+            "stash_id": stash_id,
+            "title": item.get("title") or "",
+            "page_url": item.get("page_url") or "",
+            "thumbnail_url": thumbnail_url,
+            "image_url": image_url,
+            "semantic": labels,
+            "keywords": tags,
+        }
+
+    def semantic_map(self) -> dict:
+        with self.lock:
+            items, emb = self.index._load()
+            try:
+                stamp = self.index.npy_path.stat().st_mtime
+            except OSError:
+                stamp = 0
+            signature = (len(items), int(emb.shape[1]) if emb.ndim == 2 else 0, stamp)
+            if self._map_cache and self._map_cache[0] == signature:
+                return self._map_cache[1]
+            coords = project(emb)
+            points = []
+            for item, (x, y) in zip(items, coords):
+                source_path = str(item.get("source_path") or "")
+                title = item.get("title") or source_path.replace("\\", "/").rsplit("/", 1)[-1]
+                tags = str(item.get("tags") or "")
+                points.append({
+                    "id": str(item["stash_id"]),
+                    "kind": item["kind"],
+                    "x": round(float(x), 4),
+                    "y": round(float(y), 4),
+                    "g": group_for_tags(tags),
+                    "title": title[:80],
+                    "tags": tags[:180],
+                })
+            payload = {
+                "count": len(points),
+                "dim": signature[1],
+                "groups": GROUP_NAMES,
+                "points": points,
+            }
+            self._map_cache = (signature, payload)
+            return payload
 
     def search(self, payload: dict) -> list[dict]:
         top = max(1, min(100, int(payload.get("top") or 20)))
+        offset = max(0, min(20000, int(payload.get("offset") or 0)))
+        need = offset + top
         raw_min = payload.get("min_score")
         min_score = None
         if raw_min is not None and str(raw_min).strip() != "":
@@ -154,31 +278,136 @@ class App:
         match = str(payload.get("match") or "all").strip().lower()
         kinds = payload_kinds(payload)
         text = str(payload.get("text") or "").strip()
-        if mode == "regex":
-            raw_patterns = payload.get("patterns")
-            if isinstance(raw_patterns, list):
-                patterns = [str(item).strip() for item in raw_patterns if str(item).strip()]
+        if mode in ("regex", "literal"):
+            if mode == "literal":
+                parts = split_terms(text)
+                if not parts:
+                    raise ValueError("请输入名称或关键词")
+                raw_patterns = [re.escape(part) for part in parts]
             else:
-                patterns = split_terms(text, regex_mode=True)
-            if not patterns:
-                raise ValueError("请输入正则表达式")
-            if len(patterns) > 20:
-                raise ValueError("正则关键词最多 20 个")
+                raw_patterns = payload.get("patterns")
+                if isinstance(raw_patterns, list):
+                    raw_patterns = [str(item).strip() for item in raw_patterns if str(item).strip()]
+                else:
+                    raw_patterns = split_terms(text, regex_mode=True)
+            if not raw_patterns:
+                raise ValueError("请输入正则表达式" if mode == "regex" else "请输入名称或关键词")
+            if len(raw_patterns) > 20:
+                raise ValueError("关键词最多 20 个")
             flags = re.IGNORECASE if payload.get("ignore_case", True) else 0
             compiled = []
-            for pattern in patterns:
+            for pattern in raw_patterns:
                 if len(pattern) > 300:
-                    raise ValueError("单个正则不能超过 300 字符")
+                    raise ValueError("单个关键词不能超过 300 字符")
                 try:
                     compiled.append(re.compile(pattern, flags))
                 except re.error as exc:
                     raise ValueError(f"正则无效：{pattern}（{exc}）") from exc
             with self.lock:
-                return self.index.search_regex(compiled, topk=top, kinds=kinds,
-                                                match_all=match != "any")
+                results = self.index.search_regex(compiled, topk=need, kinds=kinds,
+                                                   match_all=match != "any",
+                                                   fields=payload_fields(payload))
+            return results[offset:offset + top]
+        if mode == "hybrid":
+            if self.index.model not in ("siglip2", "qwen3vl"):
+                raise ValueError("特征搜索需要 siglip2 或 qwen3vl 索引")
+            regex_mode = bool(payload.get("regex"))
+            if regex_mode:
+                raw_patterns = payload.get("patterns")
+                if isinstance(raw_patterns, list):
+                    terms = [str(item).strip() for item in raw_patterns if str(item).strip()]
+                else:
+                    terms = split_terms(text, regex_mode=True)
+            else:
+                terms = split_terms(text)
+            if not terms:
+                raise ValueError("请输入描述或关键词")
+            if len(terms) > 20:
+                raise ValueError("关键词最多 20 个")
+            if any(len(term) > 300 for term in terms):
+                raise ValueError("单个关键词不能超过 300 字符")
+            fields = payload_fields(payload) or list(SEARCH_FIELDS)
+            flags = re.IGNORECASE if payload.get("ignore_case", True) else 0
+            if regex_mode:
+                raw_patterns = terms
+                semantic_terms = []
+                for term in terms:
+                    plain = re.sub(r"[\\^$.*+?{}\[\]|()]", " ", term)
+                    for part in re.split(r"\s+", plain):
+                        if len(part) >= 2 and part not in semantic_terms:
+                            semantic_terms.append(part)
+                    if len(semantic_terms) >= 20:
+                        break
+                semantic_terms = semantic_terms[:20]
+                semantic_match = "any"
+            else:
+                raw_patterns = [re.escape(term) for term in terms]
+                semantic_terms = terms
+                semantic_match = match
+            compiled = []
+            for pattern in raw_patterns:
+                try:
+                    compiled.append(re.compile(pattern, flags))
+                except re.error as exc:
+                    raise ValueError(f"正则无效：{pattern}（{exc}）") from exc
+            literal_need = min(20000, max(need, 1000))
+            with self.lock:
+                literal = self.index.search_regex(
+                    compiled, topk=literal_need, kinds=kinds,
+                    match_all=match != "any", fields=fields,
+                )
+                if not semantic_terms:
+                    semantic = []
+                elif len(semantic_terms) == 1:
+                    query = (self.embedder.query_embedding(semantic_terms[0])
+                             if hasattr(self.embedder, "query_embedding")
+                             else self.embedder.text_embedding(semantic_terms[0]))
+                    semantic = self.index.search_vector(
+                        query, topk=need, min_score=min_score, kinds=kinds,
+                    )
+                else:
+                    queries = [(self.embedder.query_embedding(term)
+                                if hasattr(self.embedder, "query_embedding")
+                                else self.embedder.text_embedding(term))
+                               for term in semantic_terms]
+                    semantic = self.index.search_vectors(
+                        queries, topk=need, min_score=min_score, kinds=kinds,
+                        aggregate=semantic_match,
+                    )
+            merged: dict[tuple[str, str], dict] = {}
+
+            def slot(row: dict) -> dict:
+                key = (row["kind"], str(row["stash_id"]))
+                entry = merged.get(key)
+                if entry is None:
+                    entry = dict(row)
+                    entry["semantic_score"] = 0.0
+                    entry["matched_terms"] = []
+                    merged[key] = entry
+                return entry
+
+            for row in semantic:
+                entry = slot(row)
+                entry["semantic_score"] = float(row.get("score") or 0)
+            for row in literal:
+                entry = slot(row)
+                entry["matched_terms"] = self._literal_hits(row, terms, fields, compiled)
+            for entry in merged.values():
+                semantic_score = float(entry.get("semantic_score") or 0)
+                hits = len(entry.get("matched_terms") or [])
+                entry["score"] = round(min(1.0, semantic_score + 0.14 * hits), 5)
+                entry["match_source"] = (
+                    "hybrid" if hits and semantic_score else ("keyword" if hits else "semantic")
+                )
+            ordered = sorted(
+                merged.values(),
+                key=lambda row: (-row["score"], -len(row.get("matched_terms") or []),
+                                 row["kind"], str(row["stash_id"])),
+            )
+            return ordered[offset:offset + top]
         if text:
-            if self.index.model != "siglip2":
-                raise ValueError("文本搜图需要 siglip2 索引")
+            if self.index.model not in ("siglip2", "qwen3vl"):
+                raise ValueError("文本搜图需要 siglip2 或 qwen3vl 索引")
             terms = split_terms(text)
             if not terms:
                 raise ValueError("请输入搜索描述")
@@ -186,11 +415,18 @@ class App:
                 raise ValueError("关键词最多 20 个")
             with self.lock:
                 if len(terms) == 1:
-                    q = self.embedder.text_embedding(terms[0])
-                    return self.index.search_vector(q, topk=top, min_score=min_score, kinds=kinds)
-                queries = [self.embedder.text_embedding(term) for term in terms]
-                return self.index.search_vectors(queries, topk=top, min_score=min_score,
-                                                  kinds=kinds, aggregate=match)
+                    q = (self.embedder.query_embedding(terms[0])
+                         if hasattr(self.embedder, "query_embedding")
+                         else self.embedder.text_embedding(terms[0]))
+                    results = self.index.search_vector(q, topk=need, min_score=min_score, kinds=kinds)
+                else:
+                    queries = [(self.embedder.query_embedding(term)
+                                if hasattr(self.embedder, "query_embedding")
+                                else self.embedder.text_embedding(term))
+                               for term in terms]
+                    results = self.index.search_vectors(queries, topk=need, min_score=min_score,
+                                                        kinds=kinds, aggregate=match)
+            return results[offset:offset + top]
         if payload.get("image_b64"):
             from PIL import Image
 
@@ -200,7 +436,8 @@ class App:
             img = Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
             with self.lock:
                 q = self.embedder.image_embedding(img)
-                return self.index.search_vector(q, topk=top, min_score=min_score)
+                results = self.index.search_vector(q, topk=need, min_score=min_score)
+            return results[offset:offset + top]
         sid = str(payload.get("stash_id") or "").strip()
         if not sid:
             raise ValueError("需要图片或 Stash ID")
@@ -208,9 +445,9 @@ class App:
         kinds = ["image", "scene"] if kind == "auto" else [kind]
         for k in kinds:
             with self.lock:
-                result = self.index.search_id(k, sid, topk=top, min_score=min_score)
+                result = self.index.search_id(k, sid, topk=need, min_score=min_score)
             if result is not None:
-                return result
+                return result[offset:offset + top]
         raise LookupError(f"索引中没有 {kind} #{sid}")
 
 

@@ -18,6 +18,7 @@ SCHEMA: dict[str, Any] = {
         "is_real_photo": {"type": "boolean"},
         "content_type": {"type": "string", "enum": ["real_photo", "anime", "illustration", "screenshot", "meme", "text", "other"]},
         "nsfw_level": {"type": "string", "enum": ["safe", "suggestive", "explicit"]},
+        "corporeal_nsfw": {"type": "boolean"},
         "nsfw_evidence": {"type": "string"},
         "people_count": {"type": "integer"},
         "main_subject": {"type": "string"},
@@ -27,7 +28,7 @@ SCHEMA: dict[str, Any] = {
         "category": {"type": "string", "enum": ["daily", "sexy", "adult", "anime", "sticker", "screenshot", "review", "other"]},
         "confidence": {"type": "number"},
     },
-    "required": ["is_real_photo", "content_type", "nsfw_level", "category", "tags"],
+    "required": ["is_real_photo", "content_type", "nsfw_level", "corporeal_nsfw", "category", "tags"],
 }
 
 
@@ -73,6 +74,21 @@ class VLM:
         temperature: float = 0.0,
         max_side: int = 1024,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.complete_custom(
+            images, prompt, SCHEMA, max_tokens=max_tokens, timeout=timeout,
+            temperature=temperature, max_side=max_side,
+        )
+
+    def complete_custom(
+        self,
+        images: list[str | Path],
+        prompt: str,
+        schema: dict[str, Any],
+        max_tokens: int = 200,
+        timeout: float = 180.0,
+        temperature: float = 0.0,
+        max_side: int = 1024,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for img in images:
             content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64_image(img, max_side)}})
@@ -83,7 +99,7 @@ class VLM:
             "max_tokens": max_tokens,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "verdict", "strict": True, "schema": SCHEMA},
+                "json_schema": {"name": "verdict", "strict": True, "schema": schema},
             },
             "cache_prompt": False,
         }

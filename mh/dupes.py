@@ -601,7 +601,8 @@ class DuplicateStore:
             con.close()
         image_rows = [row for row in rows if row.get("kind") != "video" and row.get("hash")]
         video_rows = [row for row in rows if row.get("kind") == "video" and row.get("frames")]
-        stash = self._stash_paths()
+        # QQ paths are not Stash objects; skip the expensive full Stash map.
+        stash = {} if scope == "qq" else self._stash_paths()
         groups_out = self._group_images(image_rows, threshold, stash)
         groups_out += self._group_videos(video_rows, threshold, stash)
         groups_out.sort(key=lambda group: (-group["total_size"], -group["count"]))
@@ -618,9 +619,10 @@ class DuplicateStore:
 
     @staticmethod
     def _slice_groups(result: dict, limit: int) -> dict:
-        limit = max(1, min(200, int(limit)))
         out = dict(result)
-        out["groups"] = result["groups"][:limit]
+        if int(limit) > 0:
+            limit = max(1, min(200, int(limit)))
+            out["groups"] = result["groups"][:limit]
         out["returned"] = len(out["groups"])
         return out
 

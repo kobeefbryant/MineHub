@@ -12,8 +12,8 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
-from .config import DATA, TOOLS
-from .stash import CONFIG, STASH_DIR, STASH_EXE
+from .config import DATA, TOOLS, ensure_dirs
+from .stash import CONFIG, STASH_DIR, STASH_EXE, ensure_config
 
 VENV_PY = Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe"
 
@@ -23,7 +23,7 @@ LOG_DIR = DATA / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 MENU = [
-    ("短片", "/scenes"),
+    ("视频", "/scenes"),
     ("图片", "/images"),
     ("集合", "/groups"),
     ("标记", "/scenes/markers"),
@@ -50,6 +50,7 @@ def _hidden_startup() -> subprocess.STARTUPINFO:
 def start_stash() -> subprocess.Popen | None:
     if port_open(INTERNAL_PORT):
         return None
+    ensure_config()
     log = open(LOG_DIR / "stash_stdout.log", "a", encoding="utf-8", errors="replace")
     # A new hidden console makes Stash see a terminal and skip its own tray icon.
     p = subprocess.Popen(
@@ -134,6 +135,8 @@ def main() -> None:
     mutex = win32event.CreateMutex(None, False, "MineHubDesktopTray")
     if win32api.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         return
+    ensure_dirs()
+    ensure_config()
     stash = start_stash()
     gateway = start_gateway()
     if not wait_ports():
@@ -161,7 +164,10 @@ def main() -> None:
                 capture_output=True,
             )
 
-    items = [pystray.MenuItem("打开 MineHub", lambda i, _: open_path(""))]
+    items = [
+        pystray.MenuItem("搜索", lambda i, _: open_path("/mh")),
+        pystray.MenuItem("打开 MineHub", lambda i, _: open_path("")),
+    ]
     items.append(pystray.Menu.SEPARATOR)
     items += [pystray.MenuItem(label, open_action(path)) for label, path in MENU]
     items.append(pystray.Menu.SEPARATOR)

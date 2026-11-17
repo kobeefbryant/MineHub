@@ -14,14 +14,17 @@ import numpy as np
 import requests
 
 from .config import DATA
-from .stash import Stash
+from .stash import ENDPOINT as STASH_ENDPOINT, Stash
 
 INDEX_DB = DATA / "vectors.sqlite"
 INDEX_NPY = DATA / "embeddings.npy"
 INDEX_DB_SIGLIP2 = DATA / "vectors_siglip2.sqlite"
 INDEX_NPY_SIGLIP2 = DATA / "embeddings_siglip2.npy"
+INDEX_DB_QWEN3VL = DATA / "vectors_qwen3vl.sqlite"
+INDEX_NPY_QWEN3VL = DATA / "embeddings_qwen3vl.npy"
 MODEL_NSFW = "nsfw-siglip2"
 MODEL_SIGLIP2 = "siglip2-base-patch16-256"
+MODEL_QWEN3VL = "qwen3-vl-embedding-2b"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -98,9 +101,20 @@ class SimilarityIndex:
                  model: str = "nsfw") -> None:
         self.model = model
         if db_path is None:
-            db_path = INDEX_DB_SIGLIP2 if model == "siglip2" else INDEX_DB
+            if model == "qwen3vl":
+                db_path = INDEX_DB_QWEN3VL
+            elif model == "siglip2":
+                db_path = INDEX_DB_SIGLIP2
+            else:
+                db_path = INDEX_DB
         if npy_path is None:
-            npy_path = INDEX_NPY_SIGLIP2 if model == "siglip2" else INDEX_NPY
+            if model == "qwen3vl":
+                npy_path = INDEX_NPY_QWEN3VL
+            elif model == "siglip2":
+                npy_path = INDEX_NPY_SIGLIP2
+            else:
+                npy_path = INDEX_NPY
+        self.dim = 2048 if model == "qwen3vl" else 768
         self.db_path = Path(db_path)
         self.npy_path = Path(npy_path)
         self._items: list[dict] | None = None
@@ -108,6 +122,10 @@ class SimilarityIndex:
         self.session = requests.Session()
 
     def make_embedder(self, device: str = "cpu"):
+        if self.model == "qwen3vl":
+            from .qwen3vl_embed import Qwen3VLEmbedder
+
+            return Qwen3VLEmbedder(device=device)
         if self.model == "siglip2":
             from .siglip2_embed import Siglip2Embedder
 
@@ -134,7 +152,7 @@ class SimilarityIndex:
         conn.close()
 
     def _save_embeddings(self, embs: list[np.ndarray]) -> None:
-        arr = np.vstack(embs).astype(np.float32) if embs else np.zeros((0, 768), dtype=np.float32)
+        arr = np.vstack(embs).astype(np.float32) if embs else np.zeros((0, self.dim), dtype=np.float32)
         np.save(self.npy_path, arr)
         conn = self._conn()
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('count',?)", (str(len(arr)),))
@@ -149,7 +167,8 @@ class SimilarityIndex:
 
         self.reset()
         embedder = self.make_embedder(device)
-        model_name = MODEL_SIGLIP2 if self.model == "siglip2" else MODEL_NSFW
+        model_name = (MODEL_QWEN3VL if self.model == "qwen3vl"
+                      else MODEL_SIGLIP2 if self.model == "siglip2" else MODEL_NSFW)
         conn = self._conn()
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('model',?)", (model_name,))
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('device',?)", (device,))
@@ -187,7 +206,10 @@ class SimilarityIndex:
                 if limit and seen >= limit:
                     break
                 try:
-                    r = self.session.get(meta["thumbnail_url"], timeout=30)
+                    url = meta["thumbnail_url"]
+                    if url.startswith("/"):
+                        url = STASH_ENDPOINT.rsplit("/", 1)[0] + url
+                    r = self.session.get(url, timeout=30)
                     r.raise_for_status()
                     img = Image.open(BytesIO(r.content)).convert("RGB")
                 except Exception:
@@ -235,7 +257,7 @@ class SimilarityIndex:
         self._items = [dict(r) for r in conn.execute("SELECT * FROM items ORDER BY row")]
         conn.close()
         if not self.npy_path.exists():
-            self._emb = np.zeros((0, 768), dtype=np.float32)
+            self._emb = np.zeros((0, self.dim), dtype=np.float32)
             return self._items, self._emb
         arr = np.load(self.npy_path).astype(np.float32)
         if arr.ndim != 2:
@@ -319,32 +341,45 @@ class SimilarityIndex:
         return self._rank_scores(scores, items, topk, min_score=min_score, kinds=kinds)
 
     def search_regex(self, patterns: list[re.Pattern], topk: int = 20,
-                     kinds: list[str] | None = None, match_all: bool = True) -> list[dict]:
+                     kinds: list[str] | None = None, match_all: bool = True,
+                     fields: list[str] | None = None) -> list[dict]:
         items, _ = self._load()
         allowed = set(kinds) if kinds else None
+        selected = set(fields) if fields else {"title", "path", "basename", "tags", "id"}
         predicate = all if match_all else any
         out = []
         for item in items:
             if allowed and item["kind"] not in allowed:
                 continue
             source_path = str(item.get("source_path") or "")
-            basename = source_path.replace("/", "\\").rsplit("\\", 1)[-1]
-            fields = [item.get("title"), source_path, basename, item.get("tags"),
-                      item.get("stash_id")]
-            haystacks = [str(value) for value in fields if value]
+            values = {
+                "title": item.get("title"),
+                "path": source_path,
+                "basename": source_path.replace("/", "\\").rsplit("\\", 1)[-1],
+                "tags": item.get("tags"),
+                "id": item.get("stash_id"),
+            }
+            haystacks = [str(values[name]) for name in ("title", "path", "basename", "tags", "id")
+                         if name in selected and values.get(name)]
             if predicate(any(pattern.search(value) for value in haystacks)
                          for pattern in patterns):
                 out.append(self._result(item))
         return out[:topk]
 
-    def search_id(self, kind: str, stash_id: str, topk: int = 20,
-                  min_score: float | None = None) -> list[dict] | None:
+    def find_vector(self, kind: str, stash_id: str) -> tuple[dict, np.ndarray] | None:
         items, emb = self._load()
         for i, item in enumerate(items):
             if item["kind"] == kind and str(item["stash_id"]) == str(stash_id):
-                return self.search_vector(emb[i], topk=topk, exclude=(kind, str(stash_id)),
-                                          min_score=min_score)
+                return item, emb[i]
         return None
+
+    def search_id(self, kind: str, stash_id: str, topk: int = 20,
+                  min_score: float | None = None) -> list[dict] | None:
+        found = self.find_vector(kind, stash_id)
+        if found is None:
+            return None
+        return self.search_vector(found[1], topk=topk, exclude=(kind, str(stash_id)),
+                                  min_score=min_score)
 
     def search_image(self, image, topk: int = 20, device: str = "cpu",
                      min_score: float | None = None) -> list[dict]:
@@ -353,7 +388,9 @@ class SimilarityIndex:
 
     def search_text(self, text: str, topk: int = 20, device: str = "cpu",
                     min_score: float | None = None) -> list[dict]:
-        if self.model != "siglip2":
-            raise RuntimeError("文本搜图需要 --model siglip2 索引")
+        if self.model not in ("siglip2", "qwen3vl"):
+            raise RuntimeError("文本搜图需要 --model siglip2 或 qwen3vl 索引")
         embedder = self.make_embedder(device)
-        return self.search_vector(embedder.text_embedding(text), topk=topk, min_score=min_score)
+        vec = (embedder.query_embedding(text) if hasattr(embedder, "query_embedding")
+               else embedder.text_embedding(text))
+        return self.search_vector(vec, topk=topk, min_score=min_score)
