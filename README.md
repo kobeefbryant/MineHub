@@ -50,7 +50,7 @@ Windows 下双击项目根目录的 `启动MineHub.bat`。脚本会调用 `.venv
 | Stash | 历史扫描并清理丢失条目后为 **482** scene + **12,404** image；2026-11-18 当前 **482** scene + **9,332** image，累计 **12,720** 条 tagged |
 | 缩略图审计 | 132,616 张 QQ Thumb 已扫描；已迁出 **17,982** 张 NSFW，94,472 张 SigLIP safe + 20,010 张 VLM safe；62 张 1 字节占位 PNG 无法读图；无待处理项 |
 | Blue-Eye safe 复核 | 全库 12,462 张三分类：**safe 3,503 / suggestive 5,519 / explicit 3,440**；已移动 **3,500** 张到 `F:\MineHubData\safe\<分类>\<月份>\`，3 张因同图非 safe 兄弟文件跳过；复核清单 `safe\blueeye_safe_manifest_*.csv` |
-| 当前库与索引（2026-11-18） | `library` **9,844** 个文件（**9,361** 张图片）；`safe` **2,923** 张图片（1.3 GB）；Stash **9,332 image / 482 scene**；SigLIP2 索引 **9,416** 条；Qwen3-VL-Embedding 索引正在按当前 9,332 张图片重建（旧索引为空） |
+| 当前库与索引（2026-11-18） | `library` **9,844** 个文件（**9,361** 张图片）；`safe` **2,923** 张图片（1.3 GB）；Stash **9,332 image / 482 scene**；SigLIP2 索引 **9,416** 条；Qwen3-VL-Embedding 索引正在按 **9,814 条**（9,332 图片 + 482 scene 截图）重建（旧索引为空） |
 | 增量复扫 | `mh.cli rescan` 已实测：2026-11-17 一轮耗时 122 s，迁出 2 个新 NSFW 原图 + 591 张残留 NSFW 缩略图；已修复 Stage 1 后计数未刷新导致新文件跳过 Stage 2 的问题，补入 24 个 `.null` 原图（VLM 全部判 safe，0 移动） |
 | 定向补漏 | 70 个 .null/点名文件 VLM：18 个 NSFW；490 张 GIF/.null 缩略图强制 VLM：11 个 NSFW、9 个原 GIF；257 个仅 SigLIP 的 kept GIF 逐帧 VLM：8 个 NSFW；合计新增 28 个原图 + 32 张缩略图 |
 | 第二轮复核 | 7,938 条已检查，622 条 flagged，0 错误；501 条源文件已移动、1 条源文件缺失，已归位状态 |
@@ -251,14 +251,14 @@ Blue-Eye（可选，DINOv3 ViT-L/16 三类分类器）已下载到 `models/blue-
 
 新增接口还包括 `/mh/api/pm/library`（QQ 选中项按分类/月移入 library）、`/mh/api/nine/list` 与 `/mh/api/nine/scan`（九图判定，返回 `mode=concurrent_single`、`slots=4` 和每格 `keep/level/reason`）；`/mh/api/dupes/groups` 在 `scope=qq` 时支持 `only_groups`，`limit=0` 返回全部群聊重复组。底层 API 统一为同源 `/mh/api/search`（`mode` 为 `semantic`、`hybrid`、`literal` 或 `regex`，可带 `regex`、`kind`、`match`、`ignore_case`、`fields`、`top`、`offset`；`hybrid + regex` 表示特征模式下的正则匹配）、`/mh/api/status`、`/mh/api/reload`、`/mh/api/media/info`（返回图片帧数，用于单帧 GIF 标注）、`/mh/api/media/features?kind=image&id=42`（Top5 语义标签 + 全部关键词 + `image_url` 原图地址）、`/mh/api/semantic/map`（二维语义投影）、`/mh/api/library/delete`（批量回收/永久删除库文件）。`top` 每次最多 100，`offset` 用于继续翻页；原生列表即按每批 100 自动追加。`fields` 可取 `title`、`path`、`basename`、`tags`、`id`，用于名称/特征/正则的字段范围。索引数据：`data\vectors_siglip2.sqlite` + `data\embeddings_siglip2.npy`；旧 `nsfw-siglip2` 索引保留在 `data\vectors.sqlite` + `data\embeddings.npy`。SigLIP2 原版双塔模型在 `F:\MineHubData\models\siglip2-base-patch16-256`（`model.safetensors` 约 1.40 GB，另有 tokenizer 约 34 MB），由索引构建脚本用 `huggingface-hub` 下载，不是系统级安装。只读 Stash 缩略图，不复制媒体文件。`mh.cli index serve --port 8765` 仅保留为脱离 Stash 的调试入口，日常不使用。
 
-可选多模态模型 **Qwen3-VL-Embedding-2B** 已接入（2B、2048 维、30+ 语言、最后 token 池化），模型在 `F:\MineHubData\models\qwen3-vl-embedding-2b`（约 4.2 GB；从 ModelScope 或 hf-mirror 下载）。它使用独立的 `data\vectors_qwen3vl.sqlite` + `data\embeddings_qwen3vl.npy`，不会覆盖 SigLIP2 索引：
+可选多模态模型 **Qwen3-VL-Embedding-2B** 已接入（2B、2048 维、30+ 语言、最后 token 池化），模型在 `E:\1Codes\MineHub\models\qwen3-vl-embedding-2b`（约 4.2 GB；从 ModelScope 或 hf-mirror 下载）。它使用独立的 `data\vectors_qwen3vl.sqlite` + `data\embeddings_qwen3vl.npy`，不会覆盖 SigLIP2 索引：
 
 ```bat
-.venv\Scripts\python.exe -m mh.cli index build --model qwen3vl --device cuda --kind images
+.venv\Scripts\python.exe -m mh.cli index build --model qwen3vl --device cuda --kind all
 .venv\Scripts\python.exe -m mh.cli index search --model qwen3vl --device cuda --text "电脑屏幕" --top 5
 ```
 
-要让网关切换到该索引，设置环境变量 `MH_INDEX_MODEL=qwen3vl` 后重启网关；默认仍是 `siglip2`。Qwen3-VL 的中英跨语言相似度明显更强，但 2B 模型在 5060 Ti 上实测约 **0.3 张/秒**（384px 输入），当前 9,332 张全量重建预计需要 **7–9 小时**；重建完成后才能切换，旧 Qwen 索引为空，SigLIP2 索引不受影响。
+要让网关切换到该索引，设置环境变量 `MH_INDEX_MODEL=qwen3vl` 后重启网关；默认仍是 `siglip2`。Qwen3-VL 的中英跨语言相似度明显更强，但 2B 模型在 5060 Ti 上实测约 **0.3 张/秒**（384px 输入），当前 **9,814 条**（9,332 图片 + 482 scene 截图）全量重建预计需要 **8–10 小时**；重建完成后才能切换，旧 Qwen 索引为空，SigLIP2 索引不受影响。
 
 ## 删除行为
 
